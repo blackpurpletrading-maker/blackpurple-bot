@@ -122,67 +122,36 @@ def calculate_amount(loads, date):
     total = subtotal + vat
     return liters, rate, subtotal, vat, total
 
+LETTERHEAD_PATH = os.path.join(os.path.dirname(__file__), 'letterhead.jpg')
+
 def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, vat, total):
     """Generate a professional PDF quote or invoice matching BlackPurple style"""
     filename = tempfile.mktemp(suffix='.pdf')
     
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
-    
-    # Purple diagonal stripe header
-    c.setFillColor(colors.HexColor('#4B0082'))
-    # Draw diagonal lines for the header decoration
-    from reportlab.lib.colors import HexColor
-    
-    # Header background
-    c.setFillColor(HexColor('#4B0082'))
-    c.rect(0, height - 80*mm, width, 80*mm, fill=1, stroke=0)
-    
-    # Draw diagonal white stripes
-    c.setFillColor(colors.white)
-    c.setStrokeColor(colors.white)
-    c.setLineWidth(15)
-    c.line(width*0.55, height, width*0.65, height - 80*mm)
-    c.line(width*0.60, height, width*0.70, height - 80*mm)
-    
-    # Logo text
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 22)
-    c.drawString(15*mm, height - 25*mm, "BlackPurple")
-    c.setFont("Helvetica", 10)
-    c.drawString(15*mm, height - 32*mm, "(PTY) LTD")
-    
-    # Company details top right
-    c.setFont("Helvetica", 8)
-    c.setFillColor(colors.white)
-    details = [
-        f"ADDRESS: {COMPANY['address']}",
-        f"REG NO: {COMPANY['reg']} BRITS",
-        f"TAX: {COMPANY['tax']}",
-        f"CELL: {COMPANY['cell']}",
-        COMPANY['email'],
-    ]
-    y_pos = height - 20*mm
-    for detail in details:
-        c.drawRightString(width - 15*mm, y_pos, detail)
-        y_pos -= 6*mm
+
+    # Draw letterhead image at the top spanning full width
+    header_height = 38*mm
+    if os.path.exists(LETTERHEAD_PATH):
+        c.drawImage(LETTERHEAD_PATH, 0, height - header_height, width=width, height=header_height, preserveAspectRatio=False)
     
     # Document type and reference
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 16)
-    c.drawRightString(width - 15*mm, height - 95*mm, doc_type)
+    c.drawRightString(width - 15*mm, height - 55*mm, doc_type)
     
     c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(width - 15*mm, height - 103*mm, f"{doc_type} REF: {ref}")
+    c.drawRightString(width - 15*mm, height - 63*mm, f"{doc_type} REF: {ref}")
     if po_number:
-        c.drawRightString(width - 15*mm, height - 110*mm, f"PO no: {po_number}")
-    c.drawRightString(width - 15*mm, height - 117*mm, date.strftime("%d %B %Y"))
+        c.drawRightString(width - 15*mm, height - 70*mm, f"PO no: {po_number}")
+    c.drawRightString(width - 15*mm, height - 77*mm, date.strftime("%d %B %Y"))
     
     # Bill to section
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(15*mm, height - 95*mm, f"{doc_type} TO:")
+    c.drawString(15*mm, height - 55*mm, f"{doc_type} TO:")
     c.setFont("Helvetica", 9)
-    y = height - 103*mm
+    y = height - 63*mm
     for line in CLIENT['address'].split('\n'):
         c.drawString(15*mm, y, line)
         y -= 5*mm
@@ -195,7 +164,7 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     c.drawString(15*mm, y, "RE: Supply of Water")
     
     # Table
-    table_top = height - 175*mm
+    table_top = height - 140*mm
     col_widths = [15*mm, 95*mm, 30*mm, 25*mm, 30*mm]
     
     # Table header
