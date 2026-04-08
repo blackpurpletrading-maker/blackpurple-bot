@@ -152,6 +152,9 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     c.drawString(15*mm, height - 55*mm, f"{doc_type} TO:")
     c.setFont("Helvetica", 9)
     y = height - 63*mm
+    # Client name first
+    c.drawString(15*mm, y, CLIENT['name'])
+    y -= 5*mm
     for line in CLIENT['address'].split('\n'):
         c.drawString(15*mm, y, line)
         y -= 5*mm
@@ -164,7 +167,7 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     c.drawString(15*mm, y, "RE: Supply of Water")
     
     # Table
-    table_top = height - 140*mm
+    table_top = height - 155*mm
     col_widths = [15*mm, 95*mm, 30*mm, 25*mm, 30*mm]
     
     # Table header
