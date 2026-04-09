@@ -313,6 +313,11 @@ def get_emails(limit=5, unread_only=False):
             _, messages = mail.search(None, 'UNSEEN')
         else:
             _, messages = mail.search(None, 'ALL')
+        
+        if not messages[0]:
+            mail.close()
+            mail.logout()
+            return []
 
         message_ids = messages[0].split()
         message_ids = message_ids[-limit:] if len(message_ids) > limit else message_ids
@@ -369,7 +374,12 @@ def check_po_emails():
         mail = imaplib.IMAP4_SSL('imap.gmail.com')
         mail.login(GMAIL_USER, GMAIL_PASSWORD)
         mail.select('inbox')
-        _, messages = mail.search(None, 'UNSEEN', 'FROM', 'pepsico.com')
+        _, messages = mail.search(None, 'FROM', 'pepsico.com')
+        
+        if not messages[0]:
+            mail.close()
+            mail.logout()
+            return []
 
         for msg_id in messages[0].split():
             _, msg_data = mail.fetch(msg_id, '(RFC822)')
