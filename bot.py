@@ -144,10 +144,11 @@ def generate_voice(text):
             except Exception as e:
                 logger.error(f"ElevenLabs request error: {e}")
         
-        # Fallback: Google TTS
+        # Fallback: Google TTS with better settings
         try:
             from gtts import gTTS
-            tts = gTTS(text=text, lang="en", slow=False)
+            # Use en-uk for more professional/authoritative sound
+            tts = gTTS(text=text, lang="en", tld="co.uk", slow=False)
             audio_file = tempfile.mktemp(suffix=".mp3")
             tts.save(audio_file)
             return audio_file
