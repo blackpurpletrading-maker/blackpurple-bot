@@ -305,16 +305,24 @@ def send_email(to_email, subject, body, attachment_paths=None, cc_email=None):
 def get_emails(limit=5, unread_only=False):
     emails = []
     try:
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
         mail.login(GMAIL_USER, GMAIL_PASSWORD)
-        mail.select('inbox')
+        
+        # Try different mailbox names
+        for mailbox in ['INBOX', '"[Gmail]/All Mail"', 'All Mail']:
+            try:
+                status, _ = mail.select(mailbox)
+                if status == 'OK':
+                    break
+            except:
+                continue
 
         if unread_only:
             _, messages = mail.search(None, 'UNSEEN')
         else:
             _, messages = mail.search(None, 'ALL')
         
-        if not messages[0]:
+        if not messages or not messages[0]:
             mail.close()
             mail.logout()
             return []
