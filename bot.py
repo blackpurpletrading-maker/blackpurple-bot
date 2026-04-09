@@ -433,6 +433,157 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     return filename
 
 
+# ─────────────────────────────────────────────
+# VOICE CALL FUNCTIONS (Twilio + ElevenLabs)
+# ─────────────────────────────────────────────
+
+def elevenlabs_tts(text):
+    """Convert text to speech using ElevenLabs and return audio bytes"""
+    try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{JARVIS_VOICE_ID}"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code == 200:
+            return response.content
+        else:
+            logger.error(f"ElevenLabs error: {response.status_code} {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"ElevenLabs TTS error: {e}")
+        return None
+
+
+def upload_audio_to_gcs(audio_bytes, filename):
+    """Upload audio file to GCS and return public URL"""
+    try:
+        from google.cloud import storage
+        tmp_path = tempfile.mktemp(suffix='.mp3')
+        with open(tmp_path, 'wb') as f:
+            f.write(audio_bytes)
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(filename)
+        blob.upload_from_filename(tmp_path, content_type='audio/mpeg')
+        blob.make_public()
+        os.remove(tmp_path)
+        return blob.public_url
+    except Exception as e:
+        logger.error(f"Audio GCS upload error: {e}")
+        return None
+
+
+def handle_voice_call(params):
+    """Handle incoming voice call - return TwiML greeting"""
+    try:
+        greeting = "Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today? Please speak after the beep."
+        audio_bytes = elevenlabs_tts(greeting)
+
+        if audio_bytes:
+            audio_url = upload_audio_to_gcs(audio_bytes, "jarvis_greeting.mp3")
+        else:
+            audio_url = None
+
+        if audio_url:
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{audio_url}</Play>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
+    </Gather>
+</Response>"""
+        else:
+            # Fallback to Twilio's built-in TTS if ElevenLabs fails
+            twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Matthew">Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today?</Say>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
+    </Gather>
+</Response>"""
+        return twiml
+    except Exception as e:
+        logger.error(f"Voice call handler error: {e}")
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Sorry, Jarvis is temporarily unavailable. Please try again later.</Say>
+</Response>"""
+
+
+def handle_voice_response(params):
+    """Handle caller's speech input and respond with Jarvis's answer"""
+    try:
+        speech_result = params.get('SpeechResult', [''])[0]
+        logger.info(f"Voice input: {speech_result}")
+
+        if not speech_result:
+            twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Matthew">I didn't catch that. Please try again.</Say>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
+    </Gather>
+</Response>"""
+            return twiml
+
+        # Get Jarvis response from Claude
+        state = load_state()
+        history = state.get("conversation_history", [])
+        jarvis_reply = ask_claude(speech_result, history)
+
+        # Update conversation history
+        history.append({"role": "user", "content": speech_result})
+        history.append({"role": "assistant", "content": jarvis_reply})
+        if len(history) > 20:
+            history = history[-20:]
+        state["conversation_history"] = history
+        save_state(state)
+
+        # Convert reply to speech with ElevenLabs
+        audio_bytes = elevenlabs_tts(jarvis_reply)
+
+        if audio_bytes:
+            audio_url = upload_audio_to_gcs(audio_bytes, f"jarvis_reply_{datetime.now().strftime('%Y%m%d%H%M%S')}.mp3")
+        else:
+            audio_url = None
+
+        if audio_url:
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{audio_url}</Play>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
+    </Gather>
+</Response>"""
+        else:
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Matthew">{jarvis_reply}</Say>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
+    </Gather>
+</Response>"""
+        return twiml
+
+    except Exception as e:
+        logger.error(f"Voice response error: {e}")
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Sorry, something went wrong. Please try again.</Say>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
+    </Gather>
+</Response>"""
+
+
+# ─────────────────────────────────────────────
+# TELEGRAM HANDLERS
+# ─────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     user_id = update.effective_user.id
@@ -445,7 +596,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Send emails to anyone\n"
             "✅ Read emails\n"
             "✅ PO tracking\n"
-            "✅ Business conversations\n\n"
+            "✅ Business conversations\n"
+            "✅ Voice calls on +1 575 419 4217\n\n"
             "*Commands:*\n"
             "📧 *emails* — Latest emails\n"
             "📄 *quotes* — Pending quotes\n"
@@ -486,7 +638,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Email cancelled.")
             return
         else:
-            # User is editing the email body
             state["pending_email_reply"]["body"] = text
             save_state(state)
             reply = state["pending_email_reply"]
@@ -615,7 +766,6 @@ def handle_whatsapp_message(from_number, message_body):
     text = message_body.strip()
     text_lower = text.lower()
 
-    # Pending email approval
     if state.get("pending_email_reply"):
         if text_lower in ["approved", "approve", "yes", "send", "send it"]:
             reply = state["pending_email_reply"]
@@ -663,7 +813,6 @@ def handle_whatsapp_message(from_number, message_body):
 
     if is_email_request(text_lower):
         draft = compose_and_send_email(text, state)
-        # Remove markdown formatting for WhatsApp
         draft = draft.replace('*', '')
         return draft
 
@@ -695,7 +844,8 @@ def handle_whatsapp_message(from_number, message_body):
             "• Send emails to anyone\n"
             "• Create quotes & invoices\n"
             "• Check your emails\n"
-            "• Answer business questions\n\n"
+            "• Answer business questions\n"
+            "• Take voice calls on +1 575 419 4217\n\n"
             "Commands: emails, quotes, invoices\n"
             "Or send loads like: 6 loads 09/04/2026"
         )
@@ -766,6 +916,10 @@ async def error_handler(update, context):
             pass
 
 
+# ─────────────────────────────────────────────
+# WEB SERVER (handles WhatsApp + Voice webhooks)
+# ─────────────────────────────────────────────
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -778,6 +932,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length).decode('utf-8')
             params = parse_qs(body)
             path = urlparse(self.path).path
+
             if path == '/whatsapp':
                 from_number = params.get('From', [''])[0]
                 message_body = params.get('Body', [''])[0]
@@ -789,10 +944,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'text/xml')
                 self.end_headers()
                 self.wfile.write(b'<?xml version="1.0" encoding="UTF-8"?><Response></Response>')
+
+            elif path == '/voice':
+                # Incoming call — play greeting and listen
+                logger.info("Incoming voice call!")
+                twiml = handle_voice_call(params)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/xml')
+                self.end_headers()
+                self.wfile.write(twiml.encode('utf-8'))
+
+            elif path == '/voice/respond':
+                # Caller spoke — process and respond
+                speech = params.get('SpeechResult', [''])[0]
+                logger.info(f"Voice speech input: {speech}")
+                twiml = handle_voice_response(params)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/xml')
+                self.end_headers()
+                self.wfile.write(twiml.encode('utf-8'))
+
             else:
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"OK")
+
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             self.send_response(500)
@@ -822,7 +998,7 @@ def main():
     job_queue = app.job_queue
     job_queue.run_daily(thursday_check, time=datetime.strptime("11:00", "%H:%M").time().replace(tzinfo=SA_TZ))
 
-    logger.info("🤖 Jarvis is online!")
+    logger.info("🤖 Jarvis is online! Voice calls ready on +1 575 419 4217")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
