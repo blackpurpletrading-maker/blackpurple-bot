@@ -483,6 +483,23 @@ def upload_audio_to_gcs(audio_bytes, filename):
         return None
 
 
+def make_outbound_call(to_number):
+    """Make an outbound call to the user's number using Twilio"""
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        call = client.calls.create(
+            to=to_number,
+            from_='+15754194217',
+            url='https://blackpurple-bot-128130746360.europe-west1.run.app/voice'
+        )
+        logger.info(f"Outbound call started: {call.sid}")
+        return True
+    except Exception as e:
+        logger.error(f"Outbound call error: {e}")
+        return False
+
+
 def handle_voice_call(params):
     """Handle incoming voice call - return TwiML greeting"""
     try:
@@ -670,6 +687,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["pending_invoice"] = None
         save_state(state)
         await update.message.reply_text(f"✅ Invoice *{inv['ref']}* sent!" if success else "❌ Failed.", parse_mode='Markdown')
+        return
+
+    # Call me command
+    if text_lower in ["call me", "call", "jarvis call me", "phone me"]:
+        await update.message.reply_text("📞 Calling you now Botshelo! Answer your phone! 🤖")
+        success = make_outbound_call("+27671032999")
+        if not success:
+            await update.message.reply_text("❌ Sorry, could not make the call. Try again.")
         return
 
     # Email commands
