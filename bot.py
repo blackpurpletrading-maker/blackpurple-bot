@@ -97,6 +97,12 @@ def load_state():
         "pending_po": None,
         "appointments": [],
         "stock_loads": 0,
+        "business_patterns": {
+            "common_loads": [],
+            "busy_days": [],
+            "total_invoiced": 0,
+            "total_paid": 0,
+        }
     }
 
 
@@ -281,33 +287,195 @@ def get_emails(limit=3, unread_only=False):
     return emails
 
 
-def ask_claude(user_message, conversation_history=None):
+# ─────────────────────────────────────────────
+# UPGRADED SMART BRAIN
+# ─────────────────────────────────────────────
+
+def build_business_context(state):
+    """Build a rich business context for Jarvis to reason with"""
+    now = datetime.now(SA_TZ)
+    invoices = state.get("invoices", [])
+    quotes = state.get("quotes", [])
+    unpaid = [inv for inv in invoices if not inv.get("paid")]
+    paid = [inv for inv in invoices if inv.get("paid")]
+    total_unpaid = sum(inv["total"] for inv in unpaid)
+    total_paid = sum(inv["total"] for inv in paid)
+    total_revenue = total_paid + total_unpaid
+    stock = state.get("stock_loads", 0)
+    appointments = state.get("appointments", [])
+
+    # Detect overdue invoices (older than 30 days)
+    overdue = []
+    for inv in unpaid:
+        try:
+            inv_date = datetime.fromisoformat(str(inv.get("date", "")))
+            if (now - inv_date.replace(tzinfo=SA_TZ)).days > 30:
+                overdue.append(inv)
+        except:
+            pass
+
+    context = f"""
+CURRENT BUSINESS STATUS ({now.strftime('%A %d %B %Y, %H:%M')}):
+
+FINANCIAL:
+- Total Revenue Generated: R{total_revenue:,.2f}
+- Total Paid: R{total_paid:,.2f}
+- Total Outstanding: R{total_unpaid:,.2f}
+- Unpaid Invoices: {len(unpaid)}
+- Overdue Invoices (30+ days): {len(overdue)}
+- Pending Quotes: {len([q for q in quotes if not q.get('invoiced')])}
+
+OPERATIONS:
+- Stock Available: {stock} loads ({stock * 10000:,.0f} litres)
+- Upcoming Appointments: {len(appointments)}
+
+PATTERNS JARVIS HAS NOTICED:
+- Most common quote size: {_get_common_loads(quotes)} loads
+- Best performing day: {_get_best_day(invoices)}
+- Average invoice value: R{_get_avg_invoice(invoices):,.2f}
+"""
+    if overdue:
+        context += f"\n⚠️ URGENT: {len(overdue)} invoice(s) are overdue! Follow up needed."
+    if stock < 5:
+        context += f"\n⚠️ LOW STOCK WARNING: Only {stock} loads remaining!"
+
+    return context
+
+
+def _get_common_loads(quotes):
+    if not quotes:
+        return "unknown"
+    loads = [q.get("loads", 0) for q in quotes]
+    if loads:
+        return max(set(loads), key=loads.count)
+    return "unknown"
+
+
+def _get_best_day(invoices):
+    if not invoices:
+        return "unknown"
+    days = {}
+    for inv in invoices:
+        try:
+            d = datetime.fromisoformat(str(inv.get("date", ""))).strftime("%A")
+            days[d] = days.get(d, 0) + 1
+        except:
+            pass
+    if days:
+        return max(days, key=days.get)
+    return "unknown"
+
+
+def _get_avg_invoice(invoices):
+    if not invoices:
+        return 0
+    totals = [inv.get("total", 0) for inv in invoices]
+    return sum(totals) / len(totals) if totals else 0
+
+
+def ask_claude(user_message, conversation_history=None, state=None):
+    """Upgraded Jarvis brain with full business context and smart reasoning"""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    system = """You are Jarvis, the AI business assistant for BlackPurple (PTY) LTD, a water supply company.
-Personality: Professional, efficient, intelligent - like Jarvis from Iron Man.
+
+    # Build rich business context
+    business_context = build_business_context(state) if state else ""
+
+    system = f"""You are Jarvis — the most intelligent AI business assistant ever built for BlackPurple (PTY) LTD, a water supply company in South Africa.
+
+You were built by Botshelo and Claude as a team. You are Botshelo's trusted business partner.
+
+YOUR PERSONALITY:
+- Speak like Tony Stark's Jarvis — professional, sharp, confident, with a hint of personality
+- You are proactive: if you notice something important in the business data, mention it
+- You think deeply before answering — consider context, history, and business implications
+- You never give generic answers — always tailor your response to BlackPurple's specific situation
+- If something seems off or risky, warn Botshelo respectfully
+- You remember patterns and learn from the conversation
+
+YOUR INTELLIGENCE LEVELS:
+1. CONTEXT AWARENESS: Always consider what was said before in the conversation
+2. PATTERN RECOGNITION: Notice trends in invoices, quotes, loads, and payments
+3. PREDICTIVE INSIGHTS: Warn about potential problems before they happen
+4. SMART SUGGESTIONS: Suggest improvements but never act without approval
+5. DECISION SUPPORT: Help Botshelo make better business decisions with data
 
 CAPABILITIES:
-- Send emails to ANYONE on behalf of BlackPurple (PTY) LTD via Gmail
+- Send emails professionally on behalf of BlackPurple
 - Create quotes and invoices as PDF documents
-- Read emails from the inbox
-- Track purchase orders and invoices
+- Read and summarize emails
+- Track POs, invoices, quotes
 - Track appointments and calendar
-- Check weather for deliveries
+- Check weather for delivery planning
 - Track stock/water loads
 - Mark invoices as paid
-- Generate daily business reports
+- Generate intelligent business reports
+- Analyze business patterns and give insights
 
-Company: BlackPurple (PTY) LTD, 1704 Mothotlung, Brits. VAT: 4420309116.
-Main client: Pioneer Foods / PepsiCo.
-Rates: R0.80/L weekdays, R0.95/L weekends/holidays. 10,000L per load.
-Bank: Standard Bank, Acc: 060645377, Branch: 052546.
-Key contacts: Gosego Masiane (gosego.masiane@pepsico.com), Shaun Jacobs (shaun.jacobs@pepsico.com)
+COMPANY DETAILS:
+- BlackPurple (PTY) LTD, 1704 Mothotlung, Brits
+- VAT: 4420309116 | Reg: 2018/534192/07
+- Main client: Pioneer Foods / PepsiCo
+- Rates: R0.80/L weekdays, R0.95/L weekends/holidays
+- 10,000L per load
+- Bank: Standard Bank, Acc: 060645377, Branch: 052546
+- Key contacts: Gosego Masiane (gosego.masiane@pepsico.com), Shaun Jacobs (shaun.jacobs@pepsico.com)
+- Email: info@blackpurple.co.za
 
-Keep responses concise and professional."""
+{business_context}
+
+IMPORTANT RULES:
+- NEVER make decisions or take actions without Botshelo's approval
+- ALWAYS suggest, never act automatically
+- If you notice something urgent (overdue invoice, low stock), mention it proactively
+- Keep responses concise but insightful
+- If asked something complex, think step by step before answering"""
+
     messages = (conversation_history or [])[-10:]
     messages.append({"role": "user", "content": user_message})
-    response = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000, system=system, messages=messages)
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1500,
+        system=system,
+        messages=messages
+    )
     return response.content[0].text
+
+
+def get_insights(state):
+    """Generate smart business insights"""
+    invoices = state.get("invoices", [])
+    quotes = state.get("quotes", [])
+    unpaid = [inv for inv in invoices if not inv.get("paid")]
+    now = datetime.now(SA_TZ)
+
+    insights = []
+
+    # Overdue check
+    for inv in unpaid:
+        try:
+            inv_date = datetime.fromisoformat(str(inv.get("date", "")))
+            days_old = (now - inv_date.replace(tzinfo=SA_TZ)).days
+            if days_old > 30:
+                insights.append(f"⚠️ Invoice {inv['ref']} is {days_old} days overdue — R{inv['total']:,.2f}")
+        except:
+            pass
+
+    # Stock warning
+    stock = state.get("stock_loads", 0)
+    if stock < 5:
+        insights.append(f"⚠️ Low stock! Only {stock} loads left — consider restocking soon")
+
+    # Quote conversion check
+    unconverted = [q for q in quotes if not q.get("invoiced")]
+    if len(unconverted) > 3:
+        insights.append(f"💡 You have {len(unconverted)} quotes not yet converted to invoices — follow up?")
+
+    # Revenue insight
+    total_unpaid = sum(inv["total"] for inv in unpaid)
+    if total_unpaid > 50000:
+        insights.append(f"💰 R{total_unpaid:,.2f} outstanding — significant amount, consider chasing payments")
+
+    return insights
 
 
 def parse_loads_message(text):
@@ -434,7 +602,7 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
 
 
 # ─────────────────────────────────────────────
-# NEW FEATURES
+# FEATURES
 # ─────────────────────────────────────────────
 
 def get_weather(city="Brits"):
@@ -449,7 +617,7 @@ def get_weather(city="Brits"):
                 humidity = data['main']['humidity']
                 wind = data['wind']['speed']
                 return f"🌤️ *Weather in {city}*\n\n🌡️ {temp}°C\n☁️ {desc}\n💧 Humidity: {humidity}%\n💨 Wind: {wind} m/s"
-        return f"🌤️ Weather: Add OPENWEATHER_API_KEY to environment for live weather."
+        return "🌤️ Add OPENWEATHER_API_KEY to environment for live weather."
     except Exception as e:
         logger.error(f"Weather error: {e}")
         return "❌ Could not fetch weather."
@@ -466,32 +634,26 @@ def get_daily_report(state):
     stock = state.get("stock_loads", 0)
 
     report = f"🌅 *Good Morning Botshelo!*\n📅 {now.strftime('%A, %d %B %Y')}\n\n"
-    report += f"💰 *Unpaid Invoices:* {len(unpaid)}\n"
-    if unpaid:
-        for inv in unpaid:
-            report += f"  • {inv['ref']} — R{inv['total']:,.2f}\n"
-        report += f"  *Total: R{total_unpaid:,.2f}*\n\n"
-    else:
-        report += "  ✅ All paid!\n\n"
-
+    report += f"💰 *Outstanding:* R{total_unpaid:,.2f} ({len(unpaid)} invoices)\n"
     report += f"📄 *Pending Quotes:* {len(pending_quotes)}\n"
-    if pending_quotes:
-        for q in pending_quotes:
-            report += f"  • {q['ref']} — R{q['total']:,.2f}\n"
-    else:
-        report += "  None\n"
-    report += "\n"
     report += f"📦 *Stock:* {stock} loads ({stock * LITERS_PER_LOAD:,.0f} L)\n\n"
 
     if today_appointments:
-        report += f"📅 *Today's Appointments:*\n"
+        report += f"📅 *Today:*\n"
         for a in today_appointments:
             report += f"  • {a.get('time', '')} — {a.get('title', '')}\n"
-    else:
-        report += "📅 No appointments today\n"
+        report += "\n"
+
+    # Smart insights
+    insights = get_insights(state)
+    if insights:
+        report += "*🧠 Jarvis Insights:*\n"
+        for insight in insights:
+            report += f"{insight}\n"
+        report += "\n"
 
     weather = get_weather("Brits")
-    report += f"\n{weather}"
+    report += weather
     return report
 
 
@@ -583,7 +745,7 @@ def make_outbound_call(to_number):
 
 def handle_voice_call(params):
     try:
-        greeting = "Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today?"
+        greeting = "Hello Botshelo! Jarvis here, your BlackPurple business assistant. How can I help you today?"
         audio_bytes = elevenlabs_tts(greeting)
         audio_url = upload_audio_to_gcs(audio_bytes, "jarvis_greeting.mp3") if audio_bytes else None
         if audio_url:
@@ -595,7 +757,7 @@ def handle_voice_call(params):
         else:
             twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Matthew">Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today?</Say>
+    <Say voice="Polly.Matthew">Hello Botshelo! Jarvis here. How can I help you today?</Say>
     <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA"></Gather>
 </Response>"""
         return twiml
@@ -615,7 +777,7 @@ def handle_voice_response(params):
 </Response>"""
         state = load_state()
         history = state.get("conversation_history", [])
-        jarvis_reply = ask_claude(speech_result, history)
+        jarvis_reply = ask_claude(speech_result, history, state)
         history.append({"role": "user", "content": speech_result})
         history.append({"role": "assistant", "content": jarvis_reply})
         if len(history) > 20:
@@ -653,17 +815,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     if state.get("authorized_user") == user_id:
         await update.message.reply_text(
-            "🤖 Good day! I'm *Jarvis*, your BlackPurple business assistant.\n\n"
-            "✅ Quotes & Invoices\n"
-            "✅ Send & read emails\n"
-            "✅ Daily business report\n"
-            "✅ Calendar & appointments\n"
-            "✅ Weather for deliveries\n"
-            "✅ Stock tracking\n"
-            "✅ Payment confirmation\n"
-            "✅ Proactive alerts\n\n"
+            "🤖 *Jarvis online. Good day, Botshelo.*\n\n"
+            "I am your BlackPurple AI business partner.\n\n"
             "*Commands:*\n"
             "📊 *report* — Daily business report\n"
+            "💡 *insights* — Smart business insights\n"
             "📧 *emails* — Latest emails\n"
             "📄 *quotes* — Pending quotes\n"
             "💰 *invoices* — Unpaid invoices\n"
@@ -671,7 +827,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🌤️ *weather* — Brits weather\n"
             "📦 *stock* — Current stock\n"
             "📞 *call me* — Jarvis calls you\n\n"
-            "Or just talk naturally! 🚀",
+            "Or just talk to me naturally. I understand context. 🧠",
             parse_mode='Markdown'
         )
     else:
@@ -743,6 +899,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📊 Generating your report...")
         report = get_daily_report(state)
         await update.message.reply_text(report, parse_mode='Markdown')
+        return
+
+    # SMART INSIGHTS
+    if text_lower in ["insights", "smart insights", "analyse", "analyze", "business insights"]:
+        insights = get_insights(state)
+        if insights:
+            msg = "🧠 *Jarvis Business Insights:*\n\n"
+            for insight in insights:
+                msg += f"{insight}\n"
+        else:
+            msg = "🧠 *All looks good Botshelo!*\n\nNo urgent issues detected. Business is running smoothly. ✅"
+        await update.message.reply_text(msg, parse_mode='Markdown')
         return
 
     # WEATHER
@@ -877,10 +1045,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=f"Invoice_{ref}.pdf", caption=caption, parse_mode='Markdown')
         return
 
-    # GENERAL CONVERSATION
+    # SMART GENERAL CONVERSATION — passes full state for context
     await update.message.chat.send_action("typing")
     history = state.get("conversation_history", [])
-    response = ask_claude(text, history)
+    response = ask_claude(text, history, state)
     history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": response})
     if len(history) > 20:
@@ -901,7 +1069,7 @@ def handle_whatsapp_message(from_number, message_body):
             success = send_email(reply["to"], reply["subject"], reply["body"])
             state["pending_email_reply"] = None
             save_state(state)
-            return f"✅ Email sent to {reply['to']}!" if success else "❌ Failed to send email."
+            return f"✅ Email sent to {reply['to']}!" if success else "❌ Failed."
         elif text_lower in ["cancel", "nevermind", "stop"]:
             state["pending_email_reply"] = None
             save_state(state)
@@ -917,7 +1085,7 @@ def handle_whatsapp_message(from_number, message_body):
         state["quotes"] = quotes
         state["pending_quote"] = None
         save_state(state)
-        return f"✅ Quote {q['ref']} sent to Gosego!" if success else "❌ Failed to send."
+        return f"✅ Quote {q['ref']} sent!" if success else "❌ Failed."
 
     if state.get("pending_invoice") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
         inv = state["pending_invoice"]
@@ -930,6 +1098,12 @@ def handle_whatsapp_message(from_number, message_body):
 
     if text_lower in ["report", "daily report", "status"]:
         return get_daily_report(state).replace('*', '')
+
+    if text_lower in ["insights", "analyse", "analyze"]:
+        insights = get_insights(state)
+        if insights:
+            return "Jarvis Insights:\n\n" + "\n".join(insights)
+        return "All looks good! No urgent issues. ✅"
 
     if "weather" in text_lower:
         return get_weather("Brits").replace('*', '')
@@ -947,12 +1121,10 @@ def handle_whatsapp_message(from_number, message_body):
         emails = get_emails(limit=3)
         if not emails:
             return "No emails found."
-        state["recent_emails"] = emails
-        save_state(state)
-        response = "📧 Your Latest Emails:\n\n"
+        response = "📧 Latest Emails:\n\n"
         for i, em in enumerate(emails, 1):
             sender = em["sender"].split("<")[0].strip()
-            response += f"{i}. From: {sender}\nSubject: {em['subject']}\n\n"
+            response += f"{i}. {sender}\n{em['subject']}\n\n"
         return response
 
     if is_email_request(text_lower):
@@ -971,9 +1143,9 @@ def handle_whatsapp_message(from_number, message_body):
     if text_lower in ["invoices", "unpaid invoices"]:
         unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
         if not unpaid:
-            return "All invoices are paid! ✅"
+            return "All invoices paid! ✅"
         total = sum(inv["total"] for inv in unpaid)
-        msg = f"Unpaid Invoices ({len(unpaid)}):\n\n"
+        msg = f"Unpaid ({len(unpaid)}):\n\n"
         for inv in unpaid:
             msg += f"• {inv['ref']} — R{inv['total']:,.2f}\n"
         msg += f"\nTotal: R{total:,.2f}"
@@ -981,11 +1153,8 @@ def handle_whatsapp_message(from_number, message_body):
 
     if text_lower in ["hi", "hello", "hey", "start"]:
         return (
-            "🤖 Good day! I'm Jarvis, your BlackPurple assistant.\n\n"
-            "Commands:\n"
-            "• report\n• emails\n• quotes\n• invoices\n"
-            "• weather\n• stock\n• appointments\n"
-            "• mark BPT250360 as paid\n\n"
+            "🤖 Jarvis here. Good day Botshelo!\n\n"
+            "Commands: report, insights, emails, quotes, invoices, weather, stock, appointments\n"
             "Or send loads like: 6 loads 09/04/2026"
         )
 
@@ -1001,12 +1170,9 @@ def handle_whatsapp_message(from_number, message_body):
         save_state(state)
         rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
         msg = (
-            f"Quote Ready!\n\nDate: {date.strftime('%d %B %Y')}\n"
-            f"Loads: {loads} ({liters:,.0f} Ltrs)\n"
-            f"Rate: R{rate:.2f}/L ({rate_type})\n"
-            f"Subtotal: R{subtotal:,.2f}\nVAT: R{vat:,.2f}\n"
-            f"TOTAL: R{total:,.2f}\nRef: {ref}\n\n"
-            f"Reply APPROVED to send to Gosego."
+            f"Quote Ready!\nDate: {date.strftime('%d %B %Y')}\n"
+            f"Loads: {loads} ({liters:,.0f} Ltrs)\nRate: R{rate:.2f}/L ({rate_type})\n"
+            f"Total: R{total:,.2f}\nRef: {ref}\n\nReply APPROVED to send."
         )
         if pdf_url:
             send_whatsapp_message(from_number, msg, media_url=pdf_url)
@@ -1014,7 +1180,7 @@ def handle_whatsapp_message(from_number, message_body):
         return msg
 
     history = state.get("conversation_history", [])
-    response = ask_claude(text, history)
+    response = ask_claude(text, history, state)
     history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": response})
     if len(history) > 20:
@@ -1153,14 +1319,11 @@ def main():
     app.add_error_handler(error_handler)
 
     job_queue = app.job_queue
-    # Daily morning report at 7:00 AM
     job_queue.run_daily(morning_report, time=datetime.strptime("07:00", "%H:%M").time().replace(tzinfo=SA_TZ))
-    # Thursday check at 11:00 AM
     job_queue.run_daily(thursday_check, time=datetime.strptime("11:00", "%H:%M").time().replace(tzinfo=SA_TZ), days=(3,))
-    # Monday unpaid alert at 8:00 AM
     job_queue.run_daily(unpaid_alert, time=datetime.strptime("08:00", "%H:%M").time().replace(tzinfo=SA_TZ), days=(0,))
 
-    logger.info("🤖 Jarvis is online with all features!")
+    logger.info("🤖 Jarvis is online — smarter than ever!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
