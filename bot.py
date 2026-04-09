@@ -40,6 +40,7 @@ TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_WHATSAPP_NUMBER = os.environ.get('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
 YOUR_WHATSAPP_NUMBER = os.environ.get('YOUR_WHATSAPP_NUMBER', 'whatsapp:+27671032999')
 GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'blackpurple-jarvis-docs')
+OPENWEATHER_API_KEY = os.environ.get('OPENWEATHER_API_KEY', '')
 
 JARVIS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
 GOSEGO_EMAIL = "Gosego.Masiane@pepsico.com"
@@ -94,6 +95,8 @@ def load_state():
         "recent_emails": [],
         "pending_email_reply": None,
         "pending_po": None,
+        "appointments": [],
+        "stock_loads": 0,
     }
 
 
@@ -123,7 +126,6 @@ def calculate_amount(loads, date):
 
 
 def is_email_request(text_lower):
-    """Check if the message is an email sending request"""
     email_keywords = [
         "send email", "send an email", "email to", "send a mail",
         "write email", "compose email", "draft email",
@@ -197,14 +199,13 @@ def send_email(to_email, subject, body, attachment_paths=None, cc_email=None):
 
 
 def compose_and_send_email(text, state):
-    """Use Claude to compose an email and prepare it for sending"""
-    prompt = f"""You are Jarvis, assistant for BlackPurple (PTY) LTD. 
+    prompt = f"""You are Jarvis, assistant for BlackPurple (PTY) LTD.
 The user wants to send an email. Extract the details and compose a professional email.
 
 User request: {text}
 
 Reply in EXACTLY this format with no extra text:
-TO: [email address - if not specified, ask user]
+TO: [email address]
 SUBJECT: [professional subject line]
 BODY: [professional email body from BlackPurple (PTY) LTD]"""
 
@@ -215,18 +216,14 @@ BODY: [professional email body from BlackPurple (PTY) LTD]"""
         messages=[{"role": "user", "content": prompt}]
     )
     result = response.content[0].text
-
     to_match = re.search(r'TO:\s*(.+)', result)
     subject_match = re.search(r'SUBJECT:\s*(.+)', result)
     body_match = re.search(r'BODY:\s*([\s\S]+)', result)
-
     to_email = to_match.group(1).strip() if to_match else ""
     subject = subject_match.group(1).strip() if subject_match else "BlackPurple Communication"
     body = body_match.group(1).strip() if body_match else result
-
     state["pending_email_reply"] = {"to": to_email, "subject": subject, "body": body}
     save_state(state)
-
     return f"📧 *Email Draft*\n\n*To:* {to_email}\n*Subject:* {subject}\n\n{body}\n\nReply *APPROVED* to send or tell me what to change."
 
 
@@ -289,12 +286,16 @@ def ask_claude(user_message, conversation_history=None):
     system = """You are Jarvis, the AI business assistant for BlackPurple (PTY) LTD, a water supply company.
 Personality: Professional, efficient, intelligent - like Jarvis from Iron Man.
 
-IMPORTANT CAPABILITIES - You CAN do all of these:
+CAPABILITIES:
 - Send emails to ANYONE on behalf of BlackPurple (PTY) LTD via Gmail
 - Create quotes and invoices as PDF documents
 - Read emails from the inbox
 - Track purchase orders and invoices
-- Have business conversations
+- Track appointments and calendar
+- Check weather for deliveries
+- Track stock/water loads
+- Mark invoices as paid
+- Generate daily business reports
 
 Company: BlackPurple (PTY) LTD, 1704 Mothotlung, Brits. VAT: 4420309116.
 Main client: Pioneer Foods / PepsiCo.
@@ -302,7 +303,6 @@ Rates: R0.80/L weekdays, R0.95/L weekends/holidays. 10,000L per load.
 Bank: Standard Bank, Acc: 060645377, Branch: 052546.
 Key contacts: Gosego Masiane (gosego.masiane@pepsico.com), Shaun Jacobs (shaun.jacobs@pepsico.com)
 
-When someone asks you to send an email, DO NOT say you cannot. Instead say you are preparing the email draft.
 Keep responses concise and professional."""
     messages = (conversation_history or [])[-10:]
     messages.append({"role": "user", "content": user_message})
@@ -434,38 +434,120 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
 
 
 # ─────────────────────────────────────────────
-# VOICE CALL FUNCTIONS (Twilio + ElevenLabs)
+# NEW FEATURES
+# ─────────────────────────────────────────────
+
+def get_weather(city="Brits"):
+    try:
+        if OPENWEATHER_API_KEY:
+            url = f"https://api.openweathermap.org/data/2.5/weather?q={city},ZA&appid={OPENWEATHER_API_KEY}&units=metric"
+            response = requests.get(url)
+            data = response.json()
+            if response.status_code == 200:
+                temp = data['main']['temp']
+                desc = data['weather'][0]['description'].capitalize()
+                humidity = data['main']['humidity']
+                wind = data['wind']['speed']
+                return f"🌤️ *Weather in {city}*\n\n🌡️ {temp}°C\n☁️ {desc}\n💧 Humidity: {humidity}%\n💨 Wind: {wind} m/s"
+        return f"🌤️ Weather: Add OPENWEATHER_API_KEY to environment for live weather."
+    except Exception as e:
+        logger.error(f"Weather error: {e}")
+        return "❌ Could not fetch weather."
+
+
+def get_daily_report(state):
+    now = datetime.now(SA_TZ)
+    unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
+    pending_quotes = [q for q in state.get("quotes", []) if not q.get("invoiced")]
+    total_unpaid = sum(inv["total"] for inv in unpaid)
+    appointments = state.get("appointments", [])
+    today_str = now.strftime("%Y-%m-%d")
+    today_appointments = [a for a in appointments if str(a.get("date", "")).startswith(today_str)]
+    stock = state.get("stock_loads", 0)
+
+    report = f"🌅 *Good Morning Botshelo!*\n📅 {now.strftime('%A, %d %B %Y')}\n\n"
+    report += f"💰 *Unpaid Invoices:* {len(unpaid)}\n"
+    if unpaid:
+        for inv in unpaid:
+            report += f"  • {inv['ref']} — R{inv['total']:,.2f}\n"
+        report += f"  *Total: R{total_unpaid:,.2f}*\n\n"
+    else:
+        report += "  ✅ All paid!\n\n"
+
+    report += f"📄 *Pending Quotes:* {len(pending_quotes)}\n"
+    if pending_quotes:
+        for q in pending_quotes:
+            report += f"  • {q['ref']} — R{q['total']:,.2f}\n"
+    else:
+        report += "  None\n"
+    report += "\n"
+    report += f"📦 *Stock:* {stock} loads ({stock * LITERS_PER_LOAD:,.0f} L)\n\n"
+
+    if today_appointments:
+        report += f"📅 *Today's Appointments:*\n"
+        for a in today_appointments:
+            report += f"  • {a.get('time', '')} — {a.get('title', '')}\n"
+    else:
+        report += "📅 No appointments today\n"
+
+    weather = get_weather("Brits")
+    report += f"\n{weather}"
+    return report
+
+
+def mark_invoice_paid(ref, state):
+    for inv in state.get("invoices", []):
+        if inv["ref"].lower() == ref.lower():
+            inv["paid"] = True
+            save_state(state)
+            return f"✅ Invoice *{ref}* marked as paid! 💰"
+    return f"❌ Invoice {ref} not found."
+
+
+def add_appointment(title, date_str, time_str, state):
+    appointments = state.get("appointments", [])
+    appointment = {"title": title, "date": date_str, "time": time_str, "id": len(appointments) + 1}
+    appointments.append(appointment)
+    state["appointments"] = appointments
+    save_state(state)
+    return f"📅 *Appointment Added!*\n\n📌 {title}\n📅 {date_str}\n🕐 {time_str}"
+
+
+def get_appointments(state):
+    appointments = state.get("appointments", [])
+    if not appointments:
+        return "📅 No appointments scheduled."
+    msg = "📅 *Upcoming Appointments:*\n\n"
+    for a in appointments:
+        msg += f"• {a.get('date', '')} at {a.get('time', '')} — {a.get('title', '')}\n"
+    return msg
+
+
+def update_stock(loads, state):
+    state["stock_loads"] = loads
+    save_state(state)
+    return f"📦 *Stock Updated!*\n\n💧 {loads} loads\n🪣 {loads * LITERS_PER_LOAD:,.0f} Litres"
+
+
+# ─────────────────────────────────────────────
+# VOICE CALL FUNCTIONS
 # ─────────────────────────────────────────────
 
 def elevenlabs_tts(text):
-    """Convert text to speech using ElevenLabs and return audio bytes"""
     try:
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{JARVIS_VOICE_ID}"
-        headers = {
-            "xi-api-key": ELEVENLABS_API_KEY,
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "text": text,
-            "model_id": "eleven_monolingual_v1",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75
-            }
-        }
+        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        payload = {"text": text, "model_id": "eleven_monolingual_v1", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code == 200:
             return response.content
-        else:
-            logger.error(f"ElevenLabs error: {response.status_code} {response.text}")
-            return None
+        return None
     except Exception as e:
         logger.error(f"ElevenLabs TTS error: {e}")
         return None
 
 
 def upload_audio_to_gcs(audio_bytes, filename):
-    """Upload audio file to GCS and return public URL"""
     try:
         from google.cloud import storage
         tmp_path = tempfile.mktemp(suffix='.mp3')
@@ -484,7 +566,6 @@ def upload_audio_to_gcs(audio_bytes, filename):
 
 
 def make_outbound_call(to_number):
-    """Make an outbound call to the user's number using Twilio"""
     try:
         from twilio.rest import Client
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -501,100 +582,64 @@ def make_outbound_call(to_number):
 
 
 def handle_voice_call(params):
-    """Handle incoming voice call - return TwiML greeting"""
     try:
-        greeting = "Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today? Please speak after the beep."
+        greeting = "Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today?"
         audio_bytes = elevenlabs_tts(greeting)
-
-        if audio_bytes:
-            audio_url = upload_audio_to_gcs(audio_bytes, "jarvis_greeting.mp3")
-        else:
-            audio_url = None
-
+        audio_url = upload_audio_to_gcs(audio_bytes, "jarvis_greeting.mp3") if audio_bytes else None
         if audio_url:
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{audio_url}</Play>
-    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
-    </Gather>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA"></Gather>
 </Response>"""
         else:
-            # Fallback to Twilio's built-in TTS if ElevenLabs fails
             twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Matthew">Hello! This is Jarvis, BlackPurple's AI assistant. How can I help you today?</Say>
-    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
-    </Gather>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA"></Gather>
 </Response>"""
         return twiml
     except Exception as e:
         logger.error(f"Voice call handler error: {e}")
-        return """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>Sorry, Jarvis is temporarily unavailable. Please try again later.</Say>
-</Response>"""
+        return """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Jarvis is temporarily unavailable.</Say></Response>"""
 
 
 def handle_voice_response(params):
-    """Handle caller's speech input and respond with Jarvis's answer"""
     try:
         speech_result = params.get('SpeechResult', [''])[0]
-        logger.info(f"Voice input: {speech_result}")
-
         if not speech_result:
-            twiml = """<?xml version="1.0" encoding="UTF-8"?>
+            return """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Matthew">I didn't catch that. Please try again.</Say>
-    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
-    </Gather>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA"></Gather>
 </Response>"""
-            return twiml
-
-        # Get Jarvis response from Claude
         state = load_state()
         history = state.get("conversation_history", [])
         jarvis_reply = ask_claude(speech_result, history)
-
-        # Update conversation history
         history.append({"role": "user", "content": speech_result})
         history.append({"role": "assistant", "content": jarvis_reply})
         if len(history) > 20:
             history = history[-20:]
         state["conversation_history"] = history
         save_state(state)
-
-        # Convert reply to speech with ElevenLabs
         audio_bytes = elevenlabs_tts(jarvis_reply)
-
-        if audio_bytes:
-            audio_url = upload_audio_to_gcs(audio_bytes, f"jarvis_reply_{datetime.now().strftime('%Y%m%d%H%M%S')}.mp3")
-        else:
-            audio_url = None
-
+        audio_url = upload_audio_to_gcs(audio_bytes, f"jarvis_reply_{datetime.now().strftime('%Y%m%d%H%M%S')}.mp3") if audio_bytes else None
         if audio_url:
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{audio_url}</Play>
-    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
-    </Gather>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA"></Gather>
 </Response>"""
         else:
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Matthew">{jarvis_reply}</Say>
-    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
-    </Gather>
+    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA"></Gather>
 </Response>"""
         return twiml
-
     except Exception as e:
         logger.error(f"Voice response error: {e}")
-        return """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>Sorry, something went wrong. Please try again.</Say>
-    <Gather input="speech" action="/voice/respond" method="POST" speechTimeout="auto" language="en-ZA">
-    </Gather>
-</Response>"""
+        return """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Something went wrong. Please try again.</Say></Response>"""
 
 
 # ─────────────────────────────────────────────
@@ -610,15 +655,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🤖 Good day! I'm *Jarvis*, your BlackPurple business assistant.\n\n"
             "✅ Quotes & Invoices\n"
-            "✅ Send emails to anyone\n"
-            "✅ Read emails\n"
-            "✅ PO tracking\n"
-            "✅ Business conversations\n"
-            "✅ Voice calls on +1 575 419 4217\n\n"
+            "✅ Send & read emails\n"
+            "✅ Daily business report\n"
+            "✅ Calendar & appointments\n"
+            "✅ Weather for deliveries\n"
+            "✅ Stock tracking\n"
+            "✅ Payment confirmation\n"
+            "✅ Proactive alerts\n\n"
             "*Commands:*\n"
+            "📊 *report* — Daily business report\n"
             "📧 *emails* — Latest emails\n"
             "📄 *quotes* — Pending quotes\n"
-            "💰 *invoices* — Unpaid invoices\n\n"
+            "💰 *invoices* — Unpaid invoices\n"
+            "📅 *appointments* — Your calendar\n"
+            "🌤️ *weather* — Brits weather\n"
+            "📦 *stock* — Current stock\n"
+            "📞 *call me* — Jarvis calls you\n\n"
             "Or just talk naturally! 🚀",
             parse_mode='Markdown'
         )
@@ -644,10 +696,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = send_email(reply["to"], reply["subject"], reply["body"])
             state["pending_email_reply"] = None
             save_state(state)
-            if success:
-                await update.message.reply_text(f"✅ Email sent to {reply['to']}!")
-            else:
-                await update.message.reply_text("❌ Failed to send email. Check Gmail settings.")
+            await update.message.reply_text(f"✅ Email sent to {reply['to']}!" if success else "❌ Failed to send email.")
             return
         elif text_lower in ["cancel", "nevermind", "stop"]:
             state["pending_email_reply"] = None
@@ -689,7 +738,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Invoice *{inv['ref']}* sent!" if success else "❌ Failed.", parse_mode='Markdown')
         return
 
-    # Call me command
+    # DAILY REPORT
+    if text_lower in ["report", "daily report", "morning report", "status"]:
+        await update.message.reply_text("📊 Generating your report...")
+        report = get_daily_report(state)
+        await update.message.reply_text(report, parse_mode='Markdown')
+        return
+
+    # WEATHER
+    if "weather" in text_lower:
+        city = "Brits"
+        if "pretoria" in text_lower:
+            city = "Pretoria"
+        elif "johannesburg" in text_lower or "joburg" in text_lower:
+            city = "Johannesburg"
+        weather = get_weather(city)
+        await update.message.reply_text(weather, parse_mode='Markdown')
+        return
+
+    # STOCK CHECK
+    if text_lower in ["stock", "check stock", "stock levels"]:
+        stock = state.get("stock_loads", 0)
+        await update.message.reply_text(f"📦 *Current Stock*\n\n💧 {stock} loads\n🪣 {stock * LITERS_PER_LOAD:,.0f} Litres", parse_mode='Markdown')
+        return
+
+    # UPDATE STOCK
+    stock_match = re.search(r'(?:stock|set stock|update stock)\s+(\d+)|(\d+)\s+loads?\s+(?:stock|available|in stock)', text_lower)
+    if stock_match:
+        loads = int(next(x for x in stock_match.groups() if x is not None))
+        msg = update_stock(loads, state)
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    # MARK AS PAID
+    paid_match = re.search(r'mark\s+(BPT\w+)\s+as\s+paid|paid\s+(BPT\w+)|(BPT\w+)\s+paid', text, re.IGNORECASE)
+    if paid_match:
+        ref = next(x for x in paid_match.groups() if x is not None)
+        msg = mark_invoice_paid(ref, state)
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    # APPOINTMENTS LIST
+    if text_lower in ["appointments", "calendar", "schedule", "meetings"]:
+        msg = get_appointments(state)
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    # ADD APPOINTMENT
+    appt_match = re.search(r'add\s+appointment\s+(.+?)\s+on\s+(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})\s+at\s+(\d{1,2}:\d{2})', text, re.IGNORECASE)
+    if appt_match:
+        title = appt_match.group(1)
+        date_str = appt_match.group(2)
+        time_str = appt_match.group(3)
+        msg = add_appointment(title, date_str, time_str, state)
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    # CALL ME
     if text_lower in ["call me", "call", "jarvis call me", "phone me"]:
         await update.message.reply_text("📞 Calling you now Botshelo! Answer your phone! 🤖")
         success = make_outbound_call("+27671032999")
@@ -697,7 +802,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Sorry, could not make the call. Try again.")
         return
 
-    # Email commands
+    # EMAILS
     if text_lower in ["emails", "check emails", "show emails"]:
         await update.message.reply_text("📧 Fetching emails...")
         emails = get_emails(limit=3)
@@ -709,14 +814,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📧 *Email {i}*\n👤 {sender}\n📌 {em['subject']}", parse_mode="Markdown")
         return
 
-    # Check if it's an email sending request
     if is_email_request(text_lower):
         await update.message.chat.send_action("typing")
         draft = compose_and_send_email(text, state)
         await update.message.reply_text(draft, parse_mode='Markdown')
         return
 
-    # Quotes
+    # QUOTES
     if text_lower in ["quotes", "pending quotes"]:
         quotes = [q for q in state.get("quotes", []) if not q.get("invoiced")]
         if not quotes:
@@ -728,7 +832,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='Markdown')
         return
 
-    # Invoices
+    # INVOICES
     if text_lower in ["invoices", "unpaid invoices"]:
         unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
         if not unpaid:
@@ -742,7 +846,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='Markdown')
         return
 
-    # Loads message → quote
+    # LOADS → QUOTE
     date, loads = parse_loads_message(text)
     if date and loads:
         liters, rate, subtotal, vat, total = calculate_amount(loads, date)
@@ -758,7 +862,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=f"Quote_{ref}.pdf", caption=caption, parse_mode='Markdown')
         return
 
-    # PO number → invoice
+    # PO → INVOICE
     po_match = re.search(r'\b(44\d{8}|\d{10})\b', text)
     if po_match and state.get("last_quote_data"):
         po_number = po_match.group(1)
@@ -773,7 +877,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=f"Invoice_{ref}.pdf", caption=caption, parse_mode='Markdown')
         return
 
-    # General conversation
+    # GENERAL CONVERSATION
     await update.message.chat.send_action("typing")
     history = state.get("conversation_history", [])
     response = ask_claude(text, history)
@@ -824,6 +928,21 @@ def handle_whatsapp_message(from_number, message_body):
         save_state(state)
         return f"✅ Invoice {inv['ref']} sent!" if success else "❌ Failed."
 
+    if text_lower in ["report", "daily report", "status"]:
+        return get_daily_report(state).replace('*', '')
+
+    if "weather" in text_lower:
+        return get_weather("Brits").replace('*', '')
+
+    if text_lower in ["stock", "check stock"]:
+        stock = state.get("stock_loads", 0)
+        return f"Stock: {stock} loads ({stock * LITERS_PER_LOAD:,.0f} L)"
+
+    paid_match = re.search(r'mark\s+(BPT\w+)\s+as\s+paid|paid\s+(BPT\w+)|(BPT\w+)\s+paid', text, re.IGNORECASE)
+    if paid_match:
+        ref = next(x for x in paid_match.groups() if x is not None)
+        return mark_invoice_paid(ref, state).replace('*', '')
+
     if text_lower in ["emails", "check emails"]:
         emails = get_emails(limit=3)
         if not emails:
@@ -837,15 +956,13 @@ def handle_whatsapp_message(from_number, message_body):
         return response
 
     if is_email_request(text_lower):
-        draft = compose_and_send_email(text, state)
-        draft = draft.replace('*', '')
-        return draft
+        return compose_and_send_email(text, state).replace('*', '')
 
     if text_lower in ["quotes", "pending quotes"]:
         quotes = [q for q in state.get("quotes", []) if not q.get("invoiced")]
         if not quotes:
             return "No pending quotes! ✅"
-        msg = f"📄 Pending Quotes ({len(quotes)}):\n\n"
+        msg = f"Pending Quotes ({len(quotes)}):\n\n"
         for q in quotes:
             date = datetime.fromisoformat(q["date"]).strftime('%d %b %Y')
             msg += f"• {q['ref']} — R{q['total']:,.2f} — {date}\n"
@@ -856,7 +973,7 @@ def handle_whatsapp_message(from_number, message_body):
         if not unpaid:
             return "All invoices are paid! ✅"
         total = sum(inv["total"] for inv in unpaid)
-        msg = f"💰 Unpaid Invoices ({len(unpaid)}):\n\n"
+        msg = f"Unpaid Invoices ({len(unpaid)}):\n\n"
         for inv in unpaid:
             msg += f"• {inv['ref']} — R{inv['total']:,.2f}\n"
         msg += f"\nTotal: R{total:,.2f}"
@@ -865,13 +982,10 @@ def handle_whatsapp_message(from_number, message_body):
     if text_lower in ["hi", "hello", "hey", "start"]:
         return (
             "🤖 Good day! I'm Jarvis, your BlackPurple assistant.\n\n"
-            "I can:\n"
-            "• Send emails to anyone\n"
-            "• Create quotes & invoices\n"
-            "• Check your emails\n"
-            "• Answer business questions\n"
-            "• Take voice calls on +1 575 419 4217\n\n"
-            "Commands: emails, quotes, invoices\n"
+            "Commands:\n"
+            "• report\n• emails\n• quotes\n• invoices\n"
+            "• weather\n• stock\n• appointments\n"
+            "• mark BPT250360 as paid\n\n"
             "Or send loads like: 6 loads 09/04/2026"
         )
 
@@ -887,14 +1001,11 @@ def handle_whatsapp_message(from_number, message_body):
         save_state(state)
         rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
         msg = (
-            f"📄 Quote Ready!\n\n"
-            f"Date: {date.strftime('%d %B %Y')}\n"
+            f"Quote Ready!\n\nDate: {date.strftime('%d %B %Y')}\n"
             f"Loads: {loads} ({liters:,.0f} Ltrs)\n"
             f"Rate: R{rate:.2f}/L ({rate_type})\n"
-            f"Subtotal: R{subtotal:,.2f}\n"
-            f"VAT: R{vat:,.2f}\n"
-            f"TOTAL: R{total:,.2f}\n"
-            f"Ref: {ref}\n\n"
+            f"Subtotal: R{subtotal:,.2f}\nVAT: R{vat:,.2f}\n"
+            f"TOTAL: R{total:,.2f}\nRef: {ref}\n\n"
             f"Reply APPROVED to send to Gosego."
         )
         if pdf_url:
@@ -918,6 +1029,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
 
+async def morning_report(context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    user_id = state.get("authorized_user") or AUTHORIZED_USER_ID
+    if not user_id:
+        return
+    report = get_daily_report(state)
+    await context.bot.send_message(chat_id=user_id, text=report, parse_mode='Markdown')
+    send_whatsapp_message(YOUR_WHATSAPP_NUMBER, report.replace('*', ''))
+
+
+async def unpaid_alert(context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    user_id = state.get("authorized_user") or AUTHORIZED_USER_ID
+    if not user_id:
+        return
+    unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
+    if not unpaid:
+        return
+    total = sum(inv["total"] for inv in unpaid)
+    inv_list = "\n".join([f"• {inv['ref']} - R{inv['total']:,.2f}" for inv in unpaid])
+    msg = f"⚠️ *Unpaid Invoice Alert!*\n\n{inv_list}\n\n*Total: R{total:,.2f}*"
+    await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+    send_whatsapp_message(YOUR_WHATSAPP_NUMBER, msg.replace('*', ''))
+
+
 async def thursday_check(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     user_id = state.get("authorized_user") or AUTHORIZED_USER_ID
@@ -929,7 +1065,7 @@ async def thursday_check(context: ContextTypes.DEFAULT_TYPE):
     total = sum(inv["total"] for inv in unpaid)
     inv_list = "\n".join([f"• {inv['ref']} - R{inv['total']:,.2f}" for inv in unpaid])
     await context.bot.send_message(chat_id=user_id, text=f"📅 *Thursday Check*\n\n{inv_list}\n\n*Total: R{total:,.2f}*", parse_mode='Markdown')
-    send_whatsapp_message(YOUR_WHATSAPP_NUMBER, f"📅 Thursday Check\n{inv_list}\nTotal: R{total:,.2f}")
+    send_whatsapp_message(YOUR_WHATSAPP_NUMBER, f"Thursday Check\n{inv_list}\nTotal: R{total:,.2f}")
 
 
 async def error_handler(update, context):
@@ -942,7 +1078,7 @@ async def error_handler(update, context):
 
 
 # ─────────────────────────────────────────────
-# WEB SERVER (handles WhatsApp + Voice webhooks)
+# WEB SERVER
 # ─────────────────────────────────────────────
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -971,7 +1107,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b'<?xml version="1.0" encoding="UTF-8"?><Response></Response>')
 
             elif path == '/voice':
-                # Incoming call — play greeting and listen
                 logger.info("Incoming voice call!")
                 twiml = handle_voice_call(params)
                 self.send_response(200)
@@ -980,9 +1115,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.wfile.write(twiml.encode('utf-8'))
 
             elif path == '/voice/respond':
-                # Caller spoke — process and respond
-                speech = params.get('SpeechResult', [''])[0]
-                logger.info(f"Voice speech input: {speech}")
                 twiml = handle_voice_response(params)
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/xml')
@@ -1021,9 +1153,14 @@ def main():
     app.add_error_handler(error_handler)
 
     job_queue = app.job_queue
-    job_queue.run_daily(thursday_check, time=datetime.strptime("11:00", "%H:%M").time().replace(tzinfo=SA_TZ))
+    # Daily morning report at 7:00 AM
+    job_queue.run_daily(morning_report, time=datetime.strptime("07:00", "%H:%M").time().replace(tzinfo=SA_TZ))
+    # Thursday check at 11:00 AM
+    job_queue.run_daily(thursday_check, time=datetime.strptime("11:00", "%H:%M").time().replace(tzinfo=SA_TZ), days=(3,))
+    # Monday unpaid alert at 8:00 AM
+    job_queue.run_daily(unpaid_alert, time=datetime.strptime("08:00", "%H:%M").time().replace(tzinfo=SA_TZ), days=(0,))
 
-    logger.info("🤖 Jarvis is online! Voice calls ready on +1 575 419 4217")
+    logger.info("🤖 Jarvis is online with all features!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
