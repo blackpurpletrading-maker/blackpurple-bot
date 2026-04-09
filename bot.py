@@ -517,6 +517,11 @@ def get_insights(state):
 
 
 def parse_loads_message(text):
+    """
+    Parse loads and delivery date from message.
+    Returns (delivery_date, loads) where delivery_date is when water was delivered.
+    Quote issue date is always today.
+    """
     date_pattern = r'(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
     loads_pattern = r'(\d+)\s*loads?'
     date_match = re.search(date_pattern, text)
@@ -524,18 +529,26 @@ def parse_loads_message(text):
     if date_match and loads_match:
         date_str = date_match.group(1)
         loads = int(loads_match.group(1))
-        date = datetime.now(SA_TZ)
+        delivery_date = datetime.now(SA_TZ)
         for fmt in ['%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%d/%m/%y']:
             try:
-                date = datetime.strptime(date_str, fmt)
+                delivery_date = datetime.strptime(date_str, fmt)
                 break
             except:
                 continue
-        return date, loads
+        return delivery_date, loads
     return None, None
 
 
-def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, vat, total):
+def generate_pdf(doc_type, ref, po_number, delivery_date, loads, liters, rate, subtotal, vat, total, issue_date=None):
+    """
+    Generate quote or invoice PDF.
+    delivery_date = when water was actually delivered
+    issue_date = when the quote/invoice is being sent (defaults to today)
+    """
+    if issue_date is None:
+        issue_date = datetime.now(SA_TZ)
+
     filename = tempfile.mktemp(suffix='.pdf')
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
@@ -549,9 +562,10 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     c.drawRightString(width - 15*mm, height - 63*mm, f"{doc_type} REF: {ref}")
     if po_number:
         c.drawRightString(width - 15*mm, height - 70*mm, f"PO no: {po_number}")
-        c.drawRightString(width - 15*mm, height - 77*mm, date.strftime("%d %B %Y"))
+        c.drawRightString(width - 15*mm, height - 77*mm, issue_date.strftime("%d %B %Y"))
     else:
-        c.drawRightString(width - 15*mm, height - 70*mm, date.strftime("%d %B %Y"))
+        # Quote issue date (today) shown on top right
+        c.drawRightString(width - 15*mm, height - 70*mm, issue_date.strftime("%d %B %Y"))
     c.setFont("Helvetica-Bold", 10)
     c.drawString(15*mm, height - 55*mm, f"{doc_type} TO:")
     c.setFont("Helvetica", 9)
@@ -594,7 +608,8 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     c.setFillColor(colors.black)
     c.setFont("Helvetica", 9)
     c.drawString(col_item + 1*mm, row_y + 2.5*mm, "1")
-    c.drawString(col_desc + 1*mm, row_y + 2.5*mm, f"Supply of Water ({date.strftime('%d %B %Y')})")
+    # Description uses DELIVERY date — when water was actually supplied
+    c.drawString(col_desc + 1*mm, row_y + 2.5*mm, f"Supply of Water ({delivery_date.strftime('%d %B %Y')})")
     c.drawString(col_qty + 1*mm, row_y + 2.5*mm, f"{liters:,.0f} Ltrs")
     c.drawString(col_unit + 1*mm, row_y + 2.5*mm, f"R{rate:.2f}")
     c.drawRightString(col_right - 1*mm, row_y + 2.5*mm, f"R{subtotal:,.2f}")
@@ -616,6 +631,7 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     c.setFont("Helvetica-Bold", 9)
     c.drawString(15*mm, terms_y, "Terms and Conditions:")
     c.setFont("Helvetica", 9)
+    # Fixed terms — removed the random "4"
     c.drawString(15*mm, terms_y - 6*mm, "Valid for 30 Days. 3-5 working days.")
     c.drawString(15*mm, terms_y - 12*mm, "Goods or Services are subject to prior sales.")
     acc_y = terms_y - 30*mm
@@ -1057,13 +1073,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if date and loads:
         liters, rate, subtotal, vat, total = calculate_amount(loads, date)
         ref = next_ref(state)
-        pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total)
-        quote_data = {"ref": ref, "date": date.isoformat(), "loads": loads, "liters": liters, "rate": rate, "subtotal": subtotal, "vat": vat, "total": total, "pdf_path": pdf_path, "invoiced": False}
+        issue_date = datetime.now(SA_TZ)
+        pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total, issue_date)
+        quote_data = {"ref": ref, "date": date.isoformat(), "issue_date": issue_date.isoformat(), "loads": loads, "liters": liters, "rate": rate, "subtotal": subtotal, "vat": vat, "total": total, "pdf_path": pdf_path, "invoiced": False}
         state["pending_quote"] = quote_data
         state["last_quote_data"] = quote_data
         save_state(state)
         rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
-        caption = f"📄 *Quote Ready*\n\n📅 {date.strftime('%d %B %Y')}\n💧 {loads} loads ({liters:,.0f} Ltrs)\n💰 R{rate:.2f}/L ({rate_type})\n✅ *Total: R{total:,.2f}*\nRef: {ref}\n\nReply *APPROVED* to send."
+        caption = (
+            f"📄 *Quote Ready*\n\n"
+            f"📅 Delivery date: {date.strftime('%d %B %Y')}\n"
+            f"📅 Quote date: {issue_date.strftime('%d %B %Y')}\n"
+            f"💧 {loads} loads ({liters:,.0f} Ltrs)\n"
+            f"💰 R{rate:.2f}/L ({rate_type})\n"
+            f"✅ *Total: R{total:,.2f}*\n"
+            f"Ref: {ref}\n\n"
+            f"Reply *APPROVED* to send."
+        )
         with open(pdf_path, 'rb') as f:
             await update.message.reply_document(document=f, filename=f"Quote_{ref}.pdf", caption=caption, parse_mode='Markdown')
         return
@@ -1200,17 +1226,22 @@ def handle_whatsapp_message(from_number, message_body):
     if date and loads:
         liters, rate, subtotal, vat, total = calculate_amount(loads, date)
         ref = next_ref(state)
-        pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total)
+        issue_date = datetime.now(SA_TZ)
+        pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total, issue_date)
         pdf_url = upload_to_gcs(pdf_path, f"Quote_{ref}.pdf")
-        quote_data = {"ref": ref, "date": date.isoformat(), "loads": loads, "liters": liters, "rate": rate, "subtotal": subtotal, "vat": vat, "total": total, "pdf_path": pdf_path, "pdf_url": pdf_url, "invoiced": False}
+        quote_data = {"ref": ref, "date": date.isoformat(), "issue_date": issue_date.isoformat(), "loads": loads, "liters": liters, "rate": rate, "subtotal": subtotal, "vat": vat, "total": total, "pdf_path": pdf_path, "pdf_url": pdf_url, "invoiced": False}
         state["pending_quote"] = quote_data
         state["last_quote_data"] = quote_data
         save_state(state)
         rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
         msg = (
-            f"Quote Ready!\nDate: {date.strftime('%d %B %Y')}\n"
-            f"Loads: {loads} ({liters:,.0f} Ltrs)\nRate: R{rate:.2f}/L ({rate_type})\n"
-            f"Total: R{total:,.2f}\nRef: {ref}\n\nReply APPROVED to send."
+            f"Quote Ready!\n\n"
+            f"Delivery: {date.strftime('%d %B %Y')}\n"
+            f"Quote date: {issue_date.strftime('%d %B %Y')}\n"
+            f"Loads: {loads} ({liters:,.0f} Ltrs)\n"
+            f"Rate: R{rate:.2f}/L ({rate_type})\n"
+            f"Total: R{total:,.2f}\nRef: {ref}\n\n"
+            f"Reply APPROVED to send to Gosego."
         )
         if pdf_url:
             send_whatsapp_message(from_number, msg, media_url=pdf_url)
