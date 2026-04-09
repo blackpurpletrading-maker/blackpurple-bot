@@ -6,3 +6,4 @@ requests==2.31.0
 pdfplumber==0.10.3
 gTTS==2.5.1
 twilio==8.5.0
+google-cloud-storage==2.14.0
