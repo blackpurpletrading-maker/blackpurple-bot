@@ -117,29 +117,43 @@ def calculate_amount(loads, date):
 
 def generate_voice(text):
     try:
-        if not ELEVENLABS_API_KEY:
-            return None
-        # Limit text length for free plan
         text = text[:500]
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{JARVIS_VOICE_ID}"
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": ELEVENLABS_API_KEY,
-        }
-        data = {
-            "text": text,
-            "model_id": "eleven_monolingual_v1",
-            "voice_settings": {"stability": 0.75, "similarity_boost": 0.85}
-        }
-        response = requests.post(url, json=data, headers=headers, timeout=30)
-        if response.status_code == 200:
-            audio_file = tempfile.mktemp(suffix='.mp3')
-            with open(audio_file, 'wb') as f:
-                f.write(response.content)
+        # Try ElevenLabs first
+        if ELEVENLABS_API_KEY:
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{JARVIS_VOICE_ID}"
+            headers = {
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": ELEVENLABS_API_KEY,
+            }
+            data = {
+                "text": text,
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {"stability": 0.75, "similarity_boost": 0.85}
+            }
+            try:
+                response = requests.post(url, json=data, headers=headers, timeout=15)
+                logger.info(f"ElevenLabs status: {response.status_code}")
+                if response.status_code == 200 and len(response.content) > 1000:
+                    audio_file = tempfile.mktemp(suffix='.mp3')
+                    with open(audio_file, "wb") as f:
+                        f.write(response.content)
+                    return audio_file
+                else:
+                    logger.error(f"ElevenLabs error: {response.status_code} - {response.text[:300]}")
+            except Exception as e:
+                logger.error(f"ElevenLabs request error: {e}")
+        
+        # Fallback: Google TTS
+        try:
+            from gtts import gTTS
+            tts = gTTS(text=text, lang="en", slow=False)
+            audio_file = tempfile.mktemp(suffix=".mp3")
+            tts.save(audio_file)
             return audio_file
-        else:
-            logger.error(f"ElevenLabs error: {response.status_code} - {response.text[:200]}")
+        except Exception as e:
+            logger.error(f"gTTS error: {e}")
+        
         return None
     except Exception as e:
         logger.error(f"Voice error: {e}")
