@@ -122,8 +122,20 @@ def calculate_amount(loads, date):
     return liters, rate, subtotal, vat, total
 
 
+def is_email_request(text_lower):
+    """Check if the message is an email sending request"""
+    email_keywords = [
+        "send email", "send an email", "email to", "send a mail",
+        "write email", "compose email", "draft email",
+        "send mail", "email someone", "notify", "let them know by email",
+        "inform", "tell them via email"
+    ]
+    has_at_sign = "@" in text_lower
+    has_keyword = any(kw in text_lower for kw in email_keywords)
+    return has_keyword or has_at_sign
+
+
 def upload_to_gcs(file_path, filename):
-    """Upload a file to Google Cloud Storage and return public URL"""
     try:
         from google.cloud import storage
         client = storage.Client()
@@ -131,24 +143,17 @@ def upload_to_gcs(file_path, filename):
         blob = bucket.blob(filename)
         blob.upload_from_filename(file_path)
         blob.make_public()
-        public_url = blob.public_url
-        logger.info(f"Uploaded to GCS: {public_url}")
-        return public_url
+        return blob.public_url
     except Exception as e:
         logger.error(f"GCS upload error: {e}")
         return None
 
 
 def send_whatsapp_message(to_number, message, media_url=None):
-    """Send a WhatsApp message via Twilio"""
     try:
         from twilio.rest import Client
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        params = {
-            'body': message,
-            'from_': TWILIO_WHATSAPP_NUMBER,
-            'to': to_number
-        }
+        params = {'body': message, 'from_': TWILIO_WHATSAPP_NUMBER, 'to': to_number}
         if media_url:
             params['media_url'] = [media_url]
         client.messages.create(**params)
@@ -158,131 +163,170 @@ def send_whatsapp_message(to_number, message, media_url=None):
         return False
 
 
-def handle_whatsapp_message(from_number, message_body):
-    state = load_state()
-    text = message_body.strip()
-    text_lower = text.lower()
+def send_email(to_email, subject, body, attachment_paths=None, cc_email=None):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_USER
+        msg['To'] = to_email
+        if cc_email:
+            msg['Cc'] = cc_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        if attachment_paths:
+            for path in attachment_paths:
+                if path and os.path.exists(path):
+                    with open(path, 'rb') as f:
+                        part = MIMEBase('application', 'octet-stream')
+                        part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(path)}"')
+                    msg.attach(part)
+        recipients = [to_email]
+        if cc_email:
+            recipients.append(cc_email)
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_PASSWORD)
+        server.sendmail(GMAIL_USER, recipients, msg.as_string())
+        server.quit()
+        logger.info(f"Email sent to {to_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Email error: {e}")
+        return False
 
-    if state.get("pending_quote") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
-        q = state["pending_quote"]
-        date = datetime.fromisoformat(q["date"])
-        body = (
-            f"Dear Gosego,\n\nPlease find attached our quote.\n\n"
-            f"Quote REF: {q['ref']}\nDate: {date.strftime('%d %B %Y')}\n"
-            f"Quantity: {q['liters']:,.0f} Litres\nTotal: R{q['total']:,.2f} (VAT incl.)\n\n"
-            f"Kind regards,\nBlackPurple (PTY) LTD"
-        )
-        success = send_email(GOSEGO_EMAIL, f"Quote {q['ref']} - Supply of Water - BlackPurple", body, [q['pdf_path']])
-        quotes = state.get("quotes", [])
-        quotes.append(q)
-        state["quotes"] = quotes
-        state["pending_quote"] = None
-        save_state(state)
-        return f"✅ Quote {q['ref']} sent to Gosego!" if success else "❌ Failed to send."
 
-    if state.get("pending_invoice") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
-        inv = state["pending_invoice"]
-        body = (
-            f"Dear Gosego,\n\nInvoice REF: {inv['ref']}\nPO: {inv['po_number']}\n"
-            f"Total: R{inv['total']:,.2f}\n\nKind regards,\nBlackPurple (PTY) LTD"
-        )
-        success = send_email(INVOICE_EMAIL, f"Invoice {inv['ref']} - BlackPurple", body, [inv["pdf_path"]], cc_email=GOSEGO_EMAIL)
-        state["invoices"].append({"ref": inv["ref"], "po_number": inv["po_number"], "date": inv["date"], "total": inv["total"], "pdf_path": inv["pdf_path"], "paid": False})
-        state["pending_invoice"] = None
-        save_state(state)
-        return f"✅ Invoice {inv['ref']} sent!" if success else "❌ Failed to send."
+def compose_and_send_email(text, state):
+    """Use Claude to compose an email and prepare it for sending"""
+    prompt = f"""You are Jarvis, assistant for BlackPurple (PTY) LTD. 
+The user wants to send an email. Extract the details and compose a professional email.
 
-    if text_lower in ["emails", "check emails"]:
-        emails = get_emails(limit=3)
-        if not emails:
-            return "No emails found."
-        state["recent_emails"] = emails
-        save_state(state)
-        response = "📧 Your Latest Emails:\n\n"
-        for i, em in enumerate(emails, 1):
-            sender = em["sender"].split("<")[0].strip()
-            response += f"{i}. From: {sender}\nSubject: {em['subject']}\n\n"
-        return response
+User request: {text}
 
-    if text_lower in ["quotes", "pending quotes"]:
-        quotes = [q for q in state.get("quotes", []) if not q.get("invoiced")]
-        if not quotes:
-            return "No pending quotes! ✅"
-        msg = f"📄 Pending Quotes ({len(quotes)}):\n\n"
-        for q in quotes:
-            date = datetime.fromisoformat(q["date"]).strftime('%d %b %Y')
-            msg += f"• {q['ref']} — R{q['total']:,.2f} — {date}\n"
-        return msg
+Reply in EXACTLY this format with no extra text:
+TO: [email address - if not specified, ask user]
+SUBJECT: [professional subject line]
+BODY: [professional email body from BlackPurple (PTY) LTD]"""
 
-    if text_lower in ["invoices", "unpaid invoices"]:
-        unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
-        if not unpaid:
-            return "All invoices are paid! ✅"
-        total = sum(inv["total"] for inv in unpaid)
-        msg = f"💰 Unpaid Invoices ({len(unpaid)}):\n\n"
-        for inv in unpaid:
-            msg += f"• {inv['ref']} — R{inv['total']:,.2f}\n"
-        msg += f"\nTotal: R{total:,.2f}"
-        return msg
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    result = response.content[0].text
 
-    if text_lower in ["hi", "hello", "hey", "start"]:
-        return (
-            "🤖 Good day! I'm Jarvis, your BlackPurple assistant.\n\n"
-            "Commands:\n"
-            "• emails - Check emails\n"
-            "• quotes - Pending quotes\n"
-            "• invoices - Unpaid invoices\n\n"
-            "Or send loads like: 6 loads 09/04/2026"
-        )
+    to_match = re.search(r'TO:\s*(.+)', result)
+    subject_match = re.search(r'SUBJECT:\s*(.+)', result)
+    body_match = re.search(r'BODY:\s*([\s\S]+)', result)
 
-    date, loads = parse_loads_message(text)
-    if date and loads:
-        liters, rate, subtotal, vat, total = calculate_amount(loads, date)
-        ref = next_ref(state)
-        pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total)
+    to_email = to_match.group(1).strip() if to_match else ""
+    subject = subject_match.group(1).strip() if subject_match else "BlackPurple Communication"
+    body = body_match.group(1).strip() if body_match else result
 
-        # Upload PDF to GCS
-        pdf_filename = f"Quote_{ref}.pdf"
-        pdf_url = upload_to_gcs(pdf_path, pdf_filename)
-
-        quote_data = {
-            "ref": ref, "date": date.isoformat(), "loads": loads,
-            "liters": liters, "rate": rate, "subtotal": subtotal,
-            "vat": vat, "total": total, "pdf_path": pdf_path,
-            "pdf_url": pdf_url, "invoiced": False,
-        }
-        state["pending_quote"] = quote_data
-        state["last_quote_data"] = quote_data
-        save_state(state)
-
-        rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
-        msg = (
-            f"📄 Quote Ready!\n\n"
-            f"Date: {date.strftime('%d %B %Y')}\n"
-            f"Loads: {loads} ({liters:,.0f} Ltrs)\n"
-            f"Rate: R{rate:.2f}/L ({rate_type})\n"
-            f"Subtotal: R{subtotal:,.2f}\n"
-            f"VAT: R{vat:,.2f}\n"
-            f"TOTAL: R{total:,.2f}\n"
-            f"Ref: {ref}\n\n"
-            f"Reply APPROVED to send to Gosego."
-        )
-
-        # Send PDF via WhatsApp if uploaded successfully
-        if pdf_url:
-            send_whatsapp_message(from_number, msg, media_url=pdf_url)
-            return None  # Already sent with media
-        return msg
-
-    history = state.get("conversation_history", [])
-    response = ask_claude(text, history)
-    history.append({"role": "user", "content": text})
-    history.append({"role": "assistant", "content": response})
-    if len(history) > 20:
-        history = history[-20:]
-    state["conversation_history"] = history
+    state["pending_email_reply"] = {"to": to_email, "subject": subject, "body": body}
     save_state(state)
-    return response
+
+    return f"📧 *Email Draft*\n\n*To:* {to_email}\n*Subject:* {subject}\n\n{body}\n\nReply *APPROVED* to send or tell me what to change."
+
+
+def get_emails(limit=3, unread_only=False):
+    emails = []
+    try:
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        mail.login(GMAIL_USER, GMAIL_PASSWORD)
+        for mailbox in ['INBOX', '"[Gmail]/All Mail"']:
+            try:
+                status, _ = mail.select(mailbox)
+                if status == 'OK':
+                    break
+            except:
+                continue
+        if unread_only:
+            _, messages = mail.search(None, 'UNSEEN')
+        else:
+            _, messages = mail.search(None, 'ALL')
+        if not messages or not messages[0]:
+            mail.close()
+            mail.logout()
+            return []
+        message_ids = messages[0].split()
+        message_ids = message_ids[-limit:] if len(message_ids) > limit else message_ids
+        message_ids = list(reversed(message_ids))
+        for msg_id in message_ids:
+            _, msg_data = mail.fetch(msg_id, '(RFC822)')
+            msg = email_lib.message_from_bytes(msg_data[0][1])
+            subject = decode_header(msg['Subject'])[0]
+            if isinstance(subject[0], bytes):
+                subject = subject[0].decode(subject[1] or 'utf-8', errors='replace')
+            else:
+                subject = subject[0] or 'No Subject'
+            sender = msg.get('From', 'Unknown')
+            date_str = msg.get('Date', '')
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain' and 'attachment' not in str(part.get('Content-Disposition', '')):
+                        try:
+                            body += part.get_payload(decode=True).decode('utf-8', errors='replace')
+                        except:
+                            pass
+            else:
+                try:
+                    body = msg.get_payload(decode=True).decode('utf-8', errors='replace')
+                except:
+                    body = ""
+            emails.append({'id': msg_id.decode(), 'subject': subject, 'sender': sender, 'date': date_str, 'body': body[:300], 'message_id': msg.get('Message-ID', '')})
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        logger.error(f"IMAP error: {e}")
+    return emails
+
+
+def ask_claude(user_message, conversation_history=None):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    system = """You are Jarvis, the AI business assistant for BlackPurple (PTY) LTD, a water supply company.
+Personality: Professional, efficient, intelligent - like Jarvis from Iron Man.
+
+IMPORTANT CAPABILITIES - You CAN do all of these:
+- Send emails to ANYONE on behalf of BlackPurple (PTY) LTD via Gmail
+- Create quotes and invoices as PDF documents
+- Read emails from the inbox
+- Track purchase orders and invoices
+- Have business conversations
+
+Company: BlackPurple (PTY) LTD, 1704 Mothotlung, Brits. VAT: 4420309116.
+Main client: Pioneer Foods / PepsiCo.
+Rates: R0.80/L weekdays, R0.95/L weekends/holidays. 10,000L per load.
+Bank: Standard Bank, Acc: 060645377, Branch: 052546.
+Key contacts: Gosego Masiane (gosego.masiane@pepsico.com), Shaun Jacobs (shaun.jacobs@pepsico.com)
+
+When someone asks you to send an email, DO NOT say you cannot. Instead say you are preparing the email draft.
+Keep responses concise and professional."""
+    messages = (conversation_history or [])[-10:]
+    messages.append({"role": "user", "content": user_message})
+    response = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000, system=system, messages=messages)
+    return response.content[0].text
+
+
+def parse_loads_message(text):
+    date_pattern = r'(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
+    loads_pattern = r'(\d+)\s*loads?'
+    date_match = re.search(date_pattern, text)
+    loads_match = re.search(loads_pattern, text, re.IGNORECASE)
+    if date_match and loads_match:
+        date_str = date_match.group(1)
+        loads = int(loads_match.group(1))
+        date = datetime.now(SA_TZ)
+        for fmt in ['%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%d/%m/%y']:
+            try:
+                date = datetime.strptime(date_str, fmt)
+                break
+            except:
+                continue
+        return date, loads
+    return None, None
 
 
 def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, vat, total):
@@ -389,125 +433,6 @@ def generate_pdf(doc_type, ref, po_number, date, loads, liters, rate, subtotal, 
     return filename
 
 
-def send_email(to_email, subject, body, attachment_paths=None, cc_email=None):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = GMAIL_USER
-        msg['To'] = to_email
-        if cc_email:
-            msg['Cc'] = cc_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-        if attachment_paths:
-            for path in attachment_paths:
-                if path and os.path.exists(path):
-                    with open(path, 'rb') as f:
-                        part = MIMEBase('application', 'octet-stream')
-                        part.set_payload(f.read())
-                    encoders.encode_base64(part)
-                    part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(path)}"')
-                    msg.attach(part)
-        recipients = [to_email]
-        if cc_email:
-            recipients.append(cc_email)
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(GMAIL_USER, GMAIL_PASSWORD)
-        server.sendmail(GMAIL_USER, recipients, msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        logger.error(f"Email error: {e}")
-        return False
-
-
-def get_emails(limit=3, unread_only=False):
-    emails = []
-    try:
-        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
-        mail.login(GMAIL_USER, GMAIL_PASSWORD)
-        for mailbox in ['INBOX', '"[Gmail]/All Mail"']:
-            try:
-                status, _ = mail.select(mailbox)
-                if status == 'OK':
-                    break
-            except:
-                continue
-        if unread_only:
-            _, messages = mail.search(None, 'UNSEEN')
-        else:
-            _, messages = mail.search(None, 'ALL')
-        if not messages or not messages[0]:
-            mail.close()
-            mail.logout()
-            return []
-        message_ids = messages[0].split()
-        message_ids = message_ids[-limit:] if len(message_ids) > limit else message_ids
-        message_ids = list(reversed(message_ids))
-        for msg_id in message_ids:
-            _, msg_data = mail.fetch(msg_id, '(RFC822)')
-            msg = email_lib.message_from_bytes(msg_data[0][1])
-            subject = decode_header(msg['Subject'])[0]
-            if isinstance(subject[0], bytes):
-                subject = subject[0].decode(subject[1] or 'utf-8', errors='replace')
-            else:
-                subject = subject[0] or 'No Subject'
-            sender = msg.get('From', 'Unknown')
-            date_str = msg.get('Date', '')
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == 'text/plain' and 'attachment' not in str(part.get('Content-Disposition', '')):
-                        try:
-                            body += part.get_payload(decode=True).decode('utf-8', errors='replace')
-                        except:
-                            pass
-            else:
-                try:
-                    body = msg.get_payload(decode=True).decode('utf-8', errors='replace')
-                except:
-                    body = ""
-            emails.append({'id': msg_id.decode(), 'subject': subject, 'sender': sender, 'date': date_str, 'body': body[:300], 'message_id': msg.get('Message-ID', '')})
-        mail.close()
-        mail.logout()
-    except Exception as e:
-        logger.error(f"IMAP error: {e}")
-    return emails
-
-
-def ask_claude(user_message, conversation_history=None):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    system = """You are Jarvis, the AI business assistant for BlackPurple (PTY) LTD, a water supply company.
-Personality: Professional, efficient, intelligent - like Jarvis from Iron Man.
-Company: BlackPurple (PTY) LTD, 1704 Mothotlung, Brits. VAT: 4420309116. Main client: Pioneer Foods / PepsiCo.
-Rates: R0.80/L weekdays, R0.95/L weekends/holidays. 10,000L per load.
-Bank: Standard Bank, Acc: 060645377, Branch: 052546.
-Keep responses concise and professional."""
-    messages = (conversation_history or [])[-10:]
-    messages.append({"role": "user", "content": user_message})
-    response = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000, system=system, messages=messages)
-    return response.content[0].text
-
-
-def parse_loads_message(text):
-    date_pattern = r'(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})'
-    loads_pattern = r'(\d+)\s*loads?'
-    date_match = re.search(date_pattern, text)
-    loads_match = re.search(loads_pattern, text, re.IGNORECASE)
-    if date_match and loads_match:
-        date_str = date_match.group(1)
-        loads = int(loads_match.group(1))
-        date = datetime.now(SA_TZ)
-        for fmt in ['%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%d/%m/%y']:
-            try:
-                date = datetime.strptime(date_str, fmt)
-                break
-            except:
-                continue
-        return date, loads
-    return None, None
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     user_id = update.effective_user.id
@@ -516,8 +441,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get("authorized_user") == user_id:
         await update.message.reply_text(
             "🤖 Good day! I'm *Jarvis*, your BlackPurple business assistant.\n\n"
-            "✅ Quotes & Invoices\n✅ Email reading\n✅ PO tracking\n✅ Business conversations\n\n"
-            "Or just talk to me naturally! 🚀",
+            "✅ Quotes & Invoices\n"
+            "✅ Send emails to anyone\n"
+            "✅ Read emails\n"
+            "✅ PO tracking\n"
+            "✅ Business conversations\n\n"
+            "*Commands:*\n"
+            "📧 *emails* — Latest emails\n"
+            "📄 *quotes* — Pending quotes\n"
+            "💰 *invoices* — Unpaid invoices\n\n"
+            "Or just talk naturally! 🚀",
             parse_mode='Markdown'
         )
     else:
@@ -531,9 +464,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get("authorized_user") != user_id:
         await update.message.reply_text("Sorry, this bot is private.")
         return
+
     text = update.message.text.strip()
     text_lower = text.lower()
 
+    # Pending email approval
+    if state.get("pending_email_reply"):
+        if text_lower in ["approved", "approve", "yes", "send", "send it"]:
+            reply = state["pending_email_reply"]
+            success = send_email(reply["to"], reply["subject"], reply["body"])
+            state["pending_email_reply"] = None
+            save_state(state)
+            if success:
+                await update.message.reply_text(f"✅ Email sent to {reply['to']}!")
+            else:
+                await update.message.reply_text("❌ Failed to send email. Check Gmail settings.")
+            return
+        elif text_lower in ["cancel", "nevermind", "stop"]:
+            state["pending_email_reply"] = None
+            save_state(state)
+            await update.message.reply_text("Email cancelled.")
+            return
+        else:
+            # User is editing the email body
+            state["pending_email_reply"]["body"] = text
+            save_state(state)
+            reply = state["pending_email_reply"]
+            await update.message.reply_text(
+                f"📧 *Updated Draft*\n\n*To:* {reply['to']}\n*Subject:* {reply['subject']}\n\n{text}\n\nReply *APPROVED* to send.",
+                parse_mode="Markdown"
+            )
+            return
+
+    # Pending quote approval
     if state.get("pending_quote") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
         q = state["pending_quote"]
         date = datetime.fromisoformat(q["date"])
@@ -547,6 +510,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Quote *{q['ref']}* sent to Gosego!" if success else "❌ Failed to send.", parse_mode='Markdown')
         return
 
+    # Pending invoice approval
     if state.get("pending_invoice") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
         inv = state["pending_invoice"]
         body = f"Dear Gosego,\n\nInvoice REF: {inv['ref']}\nPO: {inv['po_number']}\nTotal: R{inv['total']:,.2f}\n\nKind regards,\nBlackPurple (PTY) LTD"
@@ -557,7 +521,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Invoice *{inv['ref']}* sent!" if success else "❌ Failed.", parse_mode='Markdown')
         return
 
-    if text_lower in ["emails", "check emails"]:
+    # Email commands
+    if text_lower in ["emails", "check emails", "show emails"]:
         await update.message.reply_text("📧 Fetching emails...")
         emails = get_emails(limit=3)
         if not emails:
@@ -568,6 +533,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📧 *Email {i}*\n👤 {sender}\n📌 {em['subject']}", parse_mode="Markdown")
         return
 
+    # Check if it's an email sending request
+    if is_email_request(text_lower):
+        await update.message.chat.send_action("typing")
+        draft = compose_and_send_email(text, state)
+        await update.message.reply_text(draft, parse_mode='Markdown')
+        return
+
+    # Quotes
     if text_lower in ["quotes", "pending quotes"]:
         quotes = [q for q in state.get("quotes", []) if not q.get("invoiced")]
         if not quotes:
@@ -579,6 +552,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='Markdown')
         return
 
+    # Invoices
     if text_lower in ["invoices", "unpaid invoices"]:
         unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
         if not unpaid:
@@ -592,6 +566,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='Markdown')
         return
 
+    # Loads message → quote
     date, loads = parse_loads_message(text)
     if date and loads:
         liters, rate, subtotal, vat, total = calculate_amount(loads, date)
@@ -607,6 +582,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=f"Quote_{ref}.pdf", caption=caption, parse_mode='Markdown')
         return
 
+    # PO number → invoice
     po_match = re.search(r'\b(44\d{8}|\d{10})\b', text)
     if po_match and state.get("last_quote_data"):
         po_number = po_match.group(1)
@@ -621,6 +597,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=f"Invoice_{ref}.pdf", caption=caption, parse_mode='Markdown')
         return
 
+    # General conversation
     await update.message.chat.send_action("typing")
     history = state.get("conversation_history", [])
     response = ask_claude(text, history)
@@ -631,6 +608,134 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["conversation_history"] = history
     save_state(state)
     await update.message.reply_text(response)
+
+
+def handle_whatsapp_message(from_number, message_body):
+    state = load_state()
+    text = message_body.strip()
+    text_lower = text.lower()
+
+    # Pending email approval
+    if state.get("pending_email_reply"):
+        if text_lower in ["approved", "approve", "yes", "send", "send it"]:
+            reply = state["pending_email_reply"]
+            success = send_email(reply["to"], reply["subject"], reply["body"])
+            state["pending_email_reply"] = None
+            save_state(state)
+            return f"✅ Email sent to {reply['to']}!" if success else "❌ Failed to send email."
+        elif text_lower in ["cancel", "nevermind", "stop"]:
+            state["pending_email_reply"] = None
+            save_state(state)
+            return "Email cancelled."
+
+    if state.get("pending_quote") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
+        q = state["pending_quote"]
+        date = datetime.fromisoformat(q["date"])
+        body = f"Dear Gosego,\n\nQuote REF: {q['ref']}\nDate: {date.strftime('%d %B %Y')}\nTotal: R{q['total']:,.2f}\n\nKind regards,\nBlackPurple (PTY) LTD"
+        success = send_email(GOSEGO_EMAIL, f"Quote {q['ref']} - Supply of Water", body, [q['pdf_path']])
+        quotes = state.get("quotes", [])
+        quotes.append(q)
+        state["quotes"] = quotes
+        state["pending_quote"] = None
+        save_state(state)
+        return f"✅ Quote {q['ref']} sent to Gosego!" if success else "❌ Failed to send."
+
+    if state.get("pending_invoice") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
+        inv = state["pending_invoice"]
+        body = f"Invoice REF: {inv['ref']}\nTotal: R{inv['total']:,.2f}"
+        success = send_email(INVOICE_EMAIL, f"Invoice {inv['ref']} - BlackPurple", body, [inv["pdf_path"]], cc_email=GOSEGO_EMAIL)
+        state["invoices"].append({"ref": inv["ref"], "po_number": inv["po_number"], "date": inv["date"], "total": inv["total"], "pdf_path": inv["pdf_path"], "paid": False})
+        state["pending_invoice"] = None
+        save_state(state)
+        return f"✅ Invoice {inv['ref']} sent!" if success else "❌ Failed."
+
+    if text_lower in ["emails", "check emails"]:
+        emails = get_emails(limit=3)
+        if not emails:
+            return "No emails found."
+        state["recent_emails"] = emails
+        save_state(state)
+        response = "📧 Your Latest Emails:\n\n"
+        for i, em in enumerate(emails, 1):
+            sender = em["sender"].split("<")[0].strip()
+            response += f"{i}. From: {sender}\nSubject: {em['subject']}\n\n"
+        return response
+
+    if is_email_request(text_lower):
+        draft = compose_and_send_email(text, state)
+        # Remove markdown formatting for WhatsApp
+        draft = draft.replace('*', '')
+        return draft
+
+    if text_lower in ["quotes", "pending quotes"]:
+        quotes = [q for q in state.get("quotes", []) if not q.get("invoiced")]
+        if not quotes:
+            return "No pending quotes! ✅"
+        msg = f"📄 Pending Quotes ({len(quotes)}):\n\n"
+        for q in quotes:
+            date = datetime.fromisoformat(q["date"]).strftime('%d %b %Y')
+            msg += f"• {q['ref']} — R{q['total']:,.2f} — {date}\n"
+        return msg
+
+    if text_lower in ["invoices", "unpaid invoices"]:
+        unpaid = [inv for inv in state.get("invoices", []) if not inv.get("paid")]
+        if not unpaid:
+            return "All invoices are paid! ✅"
+        total = sum(inv["total"] for inv in unpaid)
+        msg = f"💰 Unpaid Invoices ({len(unpaid)}):\n\n"
+        for inv in unpaid:
+            msg += f"• {inv['ref']} — R{inv['total']:,.2f}\n"
+        msg += f"\nTotal: R{total:,.2f}"
+        return msg
+
+    if text_lower in ["hi", "hello", "hey", "start"]:
+        return (
+            "🤖 Good day! I'm Jarvis, your BlackPurple assistant.\n\n"
+            "I can:\n"
+            "• Send emails to anyone\n"
+            "• Create quotes & invoices\n"
+            "• Check your emails\n"
+            "• Answer business questions\n\n"
+            "Commands: emails, quotes, invoices\n"
+            "Or send loads like: 6 loads 09/04/2026"
+        )
+
+    date, loads = parse_loads_message(text)
+    if date and loads:
+        liters, rate, subtotal, vat, total = calculate_amount(loads, date)
+        ref = next_ref(state)
+        pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total)
+        pdf_url = upload_to_gcs(pdf_path, f"Quote_{ref}.pdf")
+        quote_data = {"ref": ref, "date": date.isoformat(), "loads": loads, "liters": liters, "rate": rate, "subtotal": subtotal, "vat": vat, "total": total, "pdf_path": pdf_path, "pdf_url": pdf_url, "invoiced": False}
+        state["pending_quote"] = quote_data
+        state["last_quote_data"] = quote_data
+        save_state(state)
+        rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
+        msg = (
+            f"📄 Quote Ready!\n\n"
+            f"Date: {date.strftime('%d %B %Y')}\n"
+            f"Loads: {loads} ({liters:,.0f} Ltrs)\n"
+            f"Rate: R{rate:.2f}/L ({rate_type})\n"
+            f"Subtotal: R{subtotal:,.2f}\n"
+            f"VAT: R{vat:,.2f}\n"
+            f"TOTAL: R{total:,.2f}\n"
+            f"Ref: {ref}\n\n"
+            f"Reply APPROVED to send to Gosego."
+        )
+        if pdf_url:
+            send_whatsapp_message(from_number, msg, media_url=pdf_url)
+            return None
+        return msg
+
+    history = state.get("conversation_history", [])
+    response = ask_claude(text, history)
+    history.append({"role": "user", "content": text})
+    history.append({"role": "assistant", "content": response})
+    if len(history) > 20:
+        history = history[-20:]
+    state["conversation_history"] = history
+    save_state(state)
+    return response
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,7 +778,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length).decode('utf-8')
             params = parse_qs(body)
             path = urlparse(self.path).path
-
             if path == '/whatsapp':
                 from_number = params.get('From', [''])[0]
                 message_body = params.get('Body', [''])[0]
