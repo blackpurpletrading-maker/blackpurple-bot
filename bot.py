@@ -1248,7 +1248,8 @@ def main():
 
     job_queue = app.job_queue
     job_queue.run_daily(thursday_check, time=datetime.strptime("11:00", "%H:%M").time().replace(tzinfo=SA_TZ), days=(3,))
-    job_queue.run_repeating(email_monitor_job, interval=900, first=60)
+    # Email monitor disabled temporarily for stability
+    # job_queue.run_repeating(email_monitor_job, interval=900, first=60)
 
     logger.info("🤖 Jarvis is online!")
     app.run_polling(
