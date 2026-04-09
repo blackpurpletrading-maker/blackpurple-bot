@@ -117,6 +117,10 @@ def calculate_amount(loads, date):
 
 def generate_voice(text):
     try:
+        if not ELEVENLABS_API_KEY:
+            return None
+        # Limit text length for free plan
+        text = text[:500]
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{JARVIS_VOICE_ID}"
         headers = {
             "Accept": "audio/mpeg",
@@ -128,12 +132,14 @@ def generate_voice(text):
             "model_id": "eleven_monolingual_v1",
             "voice_settings": {"stability": 0.75, "similarity_boost": 0.85}
         }
-        response = requests.post(url, json=data, headers=headers)
+        response = requests.post(url, json=data, headers=headers, timeout=30)
         if response.status_code == 200:
             audio_file = tempfile.mktemp(suffix='.mp3')
             with open(audio_file, 'wb') as f:
                 f.write(response.content)
             return audio_file
+        else:
+            logger.error(f"ElevenLabs error: {response.status_code} - {response.text[:200]}")
         return None
     except Exception as e:
         logger.error(f"Voice error: {e}")
@@ -141,12 +147,17 @@ def generate_voice(text):
 
 
 async def send_voice_message(update, context, text):
-    audio_path = generate_voice(text)
-    if audio_path and os.path.exists(audio_path):
-        with open(audio_path, 'rb') as audio:
-            await update.message.reply_voice(voice=audio)
-        os.remove(audio_path)
-    else:
+    try:
+        await update.message.reply_text("🎙️ Generating voice...")
+        audio_path = generate_voice(text)
+        if audio_path and os.path.exists(audio_path):
+            with open(audio_path, 'rb') as audio:
+                await update.message.reply_voice(voice=audio)
+            os.remove(audio_path)
+        else:
+            await update.message.reply_text(f"🎙️ {text}")
+    except Exception as e:
+        logger.error(f"Send voice error: {e}")
         await update.message.reply_text(f"🎙️ {text}")
 
 
