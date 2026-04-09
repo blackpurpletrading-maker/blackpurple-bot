@@ -596,14 +596,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get("pending_email_reply"):
         if text_lower in ["approved", "approve", "yes", "send", "send it"]:
             await handle_email_reply_send(update, context, state)
+            return
+        elif text_lower in ["cancel", "nevermind", "stop", "reset"]:
+            state["pending_email_reply"] = None
+            save_state(state)
+            await update.message.reply_text("Email draft cancelled. What else can I help you with?")
+            return
         else:
             state["pending_email_reply"]["body"] = text
             save_state(state)
             await update.message.reply_text(
-                f"Updated draft:\n\n{text}\n\nReply *APPROVED* to send.",
-                parse_mode='Markdown'
+                f"Updated draft:\n\n{text}\n\nReply *APPROVED* to send or *CANCEL* to cancel.",
+                parse_mode="Markdown"
             )
-        return
+            return
 
     # Commands
     if text_lower in ["emails", "check emails", "show emails"]:
@@ -670,37 +676,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_emails(update, context, state, voice=False, unread_only=False):
-    await update.message.reply_text("📧 Fetching your emails...")
-    emails = get_emails(limit=3, unread_only=unread_only)
+    try:
+        await update.message.reply_text("📧 Fetching your emails...")
+        emails = get_emails(limit=3, unread_only=unread_only)
 
-    if not emails:
-        msg = "No unread emails. You're all caught up! ✅" if unread_only else "No emails found."
-        await update.message.reply_text(msg)
-        return
+        if not emails:
+            msg = "No unread emails. You're all caught up! ✅" if unread_only else "No emails found."
+            await update.message.reply_text(msg)
+            return
 
-    state["recent_emails"] = emails
-    save_state(state)
+        state["recent_emails"] = emails
+        save_state(state)
 
-    if voice:
-        voice_text = f"Sir, you have {len(emails)} {'unread ' if unread_only else ''}emails. "
         for i, em in enumerate(emails, 1):
-            sender_name = em['sender'].split('<')[0].strip().replace('"', '')
-            voice_text += f"Email {i} is from {sender_name}, subject: {em['subject']}. "
-            if em['body']:
-                voice_text += f"Preview: {em['body'][:100]}. "
-        await send_voice_message(update, context, voice_text)
+            sender_name = em["sender"].split("<")[0].strip()
+            body_preview = em["body"][:150] if em["body"] else "No preview"
+            date_str = em["date"][:25] if em["date"] else "N/A"
+            await update.message.reply_text(
+                f"📧 *Email {i}*\n"
+                f"👤 *From:* {sender_name}\n"
+                f"📌 *Subject:* {em['subject']}\n"
+                f"📅 *Date:* {date_str}\n"
+                f"💬 *Preview:* {body_preview}\n\n"
+                f"_Reply: 'reply to email {i} and say...'_",
+                parse_mode="Markdown"
+            )
 
-    for i, em in enumerate(emails, 1):
-        sender_name = em['sender'].split('<')[0].strip()
-        await update.message.reply_text(
-            f"📧 *Email {i}*\n"
-            f"👤 *From:* {sender_name}\n"
-            f"📌 *Subject:* {em['subject']}\n"
-            f"📅 *Date:* {em['date'][:25] if em['date'] else 'N/A'}\n"
-            f"💬 *Preview:* {em['body'][:150]}\n\n"
-            f"_To reply: say 'reply to email {i} and say...'_",
-            parse_mode='Markdown'
-        )
+        if voice:
+            try:
+                await update.message.reply_text("🎙️ Generating voice...")
+                voice_text = f"Sir, you have {len(emails)} emails. "
+                for i, em in enumerate(emails, 1):
+                    sname = em["sender"].split("<")[0].strip().replace('"', '')
+                    voice_text += f"Email {i} from {sname}. Subject: {em['subject']}. "
+                voice_text = voice_text[:400]
+                audio_path = generate_voice(voice_text)
+                if audio_path and os.path.exists(audio_path):
+                    with open(audio_path, "rb") as audio:
+                        await update.message.reply_voice(voice=audio)
+                    os.remove(audio_path)
+                else:
+                    await update.message.reply_text("🎙️ Voice unavailable right now.")
+            except Exception as ve:
+                logger.error(f"Voice error: {ve}")
+                await update.message.reply_text("🎙️ Voice unavailable right now.")
+    except Exception as e:
+        logger.error(f"show_emails error: {e}")
+        await update.message.reply_text("❌ Error fetching emails. Please try again.")
 
 
 async def handle_email_reply_request(update, context, state, text):
