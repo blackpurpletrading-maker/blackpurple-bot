@@ -39,6 +39,7 @@ TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_WHATSAPP_NUMBER = os.environ.get('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
 YOUR_WHATSAPP_NUMBER = os.environ.get('YOUR_WHATSAPP_NUMBER', 'whatsapp:+27671032999')
+GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'blackpurple-jarvis-docs')
 
 JARVIS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
 GOSEGO_EMAIL = "Gosego.Masiane@pepsico.com"
@@ -121,11 +122,36 @@ def calculate_amount(loads, date):
     return liters, rate, subtotal, vat, total
 
 
-def send_whatsapp_message(to_number, message):
+def upload_to_gcs(file_path, filename):
+    """Upload a file to Google Cloud Storage and return public URL"""
+    try:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(filename)
+        blob.upload_from_filename(file_path)
+        blob.make_public()
+        public_url = blob.public_url
+        logger.info(f"Uploaded to GCS: {public_url}")
+        return public_url
+    except Exception as e:
+        logger.error(f"GCS upload error: {e}")
+        return None
+
+
+def send_whatsapp_message(to_number, message, media_url=None):
+    """Send a WhatsApp message via Twilio"""
     try:
         from twilio.rest import Client
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        client.messages.create(body=message, from_=TWILIO_WHATSAPP_NUMBER, to=to_number)
+        params = {
+            'body': message,
+            'from_': TWILIO_WHATSAPP_NUMBER,
+            'to': to_number
+        }
+        if media_url:
+            params['media_url'] = [media_url]
+        client.messages.create(**params)
         return True
     except Exception as e:
         logger.error(f"WhatsApp send error: {e}")
@@ -156,7 +182,6 @@ def handle_whatsapp_message(from_number, message_body):
 
     if state.get("pending_invoice") and text_lower in ["approved", "approve", "yes", "send it", "send"]:
         inv = state["pending_invoice"]
-        date = datetime.fromisoformat(inv["date"])
         body = (
             f"Dear Gosego,\n\nInvoice REF: {inv['ref']}\nPO: {inv['po_number']}\n"
             f"Total: R{inv['total']:,.2f}\n\nKind regards,\nBlackPurple (PTY) LTD"
@@ -202,12 +227,12 @@ def handle_whatsapp_message(from_number, message_body):
 
     if text_lower in ["hi", "hello", "hey", "start"]:
         return (
-            "🤖 Good day! I'm *Jarvis*, your BlackPurple assistant.\n\n"
+            "🤖 Good day! I'm Jarvis, your BlackPurple assistant.\n\n"
             "Commands:\n"
-            "• *emails* - Check emails\n"
-            "• *quotes* - Pending quotes\n"
-            "• *invoices* - Unpaid invoices\n\n"
-            "Or send loads like: _6 loads 09/04/2026_"
+            "• emails - Check emails\n"
+            "• quotes - Pending quotes\n"
+            "• invoices - Unpaid invoices\n\n"
+            "Or send loads like: 6 loads 09/04/2026"
         )
 
     date, loads = parse_loads_message(text)
@@ -215,16 +240,23 @@ def handle_whatsapp_message(from_number, message_body):
         liters, rate, subtotal, vat, total = calculate_amount(loads, date)
         ref = next_ref(state)
         pdf_path = generate_pdf("Quote", ref, None, date, loads, liters, rate, subtotal, vat, total)
+
+        # Upload PDF to GCS
+        pdf_filename = f"Quote_{ref}.pdf"
+        pdf_url = upload_to_gcs(pdf_path, pdf_filename)
+
         quote_data = {
             "ref": ref, "date": date.isoformat(), "loads": loads,
             "liters": liters, "rate": rate, "subtotal": subtotal,
-            "vat": vat, "total": total, "pdf_path": pdf_path, "invoiced": False,
+            "vat": vat, "total": total, "pdf_path": pdf_path,
+            "pdf_url": pdf_url, "invoiced": False,
         }
         state["pending_quote"] = quote_data
         state["last_quote_data"] = quote_data
         save_state(state)
+
         rate_type = "Weekend" if rate == WEEKEND_RATE else "Weekday"
-        return (
+        msg = (
             f"📄 Quote Ready!\n\n"
             f"Date: {date.strftime('%d %B %Y')}\n"
             f"Loads: {loads} ({liters:,.0f} Ltrs)\n"
@@ -235,6 +267,12 @@ def handle_whatsapp_message(from_number, message_body):
             f"Ref: {ref}\n\n"
             f"Reply APPROVED to send to Gosego."
         )
+
+        # Send PDF via WhatsApp if uploaded successfully
+        if pdf_url:
+            send_whatsapp_message(from_number, msg, media_url=pdf_url)
+            return None  # Already sent with media
+        return msg
 
     history = state.get("conversation_history", [])
     response = ask_claude(text, history)
@@ -641,7 +679,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 message_body = params.get('Body', [''])[0]
                 logger.info(f"WhatsApp from {from_number}: {message_body}")
                 response_text = handle_whatsapp_message(from_number, message_body)
-                send_whatsapp_message(from_number, response_text)
+                if response_text:
+                    send_whatsapp_message(from_number, response_text)
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/xml')
                 self.end_headers()
